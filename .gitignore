@@ -1,0 +1,17 @@
+# JavaScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Rust/Tauri build output
+src-tauri/target/
+
+# Local development logs
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Temporary binary setup archives are created outside the repository.
