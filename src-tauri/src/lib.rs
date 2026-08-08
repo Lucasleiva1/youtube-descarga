@@ -1,9 +1,13 @@
+mod download;
 mod engine;
+mod history;
 
 use serde::Serialize;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 use std::process::Command;
+use tauri::Manager;
+use url::Url;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,9 +114,10 @@ fn check_engines(app: tauri::AppHandle) -> Vec<EngineInfo> {
 }
 
 fn is_supported_youtube_url(value: &str) -> bool {
-    let lower = value.trim().to_ascii_lowercase();
-    let has_host = lower.contains("youtube.com/") || lower.contains("youtu.be/");
-    has_host && (lower.starts_with("https://") || lower.starts_with("http://"))
+    let Ok(url) = Url::parse(value.trim()) else { return false; };
+    if !matches!(url.scheme(), "https" | "http") { return false; }
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else { return false; };
+    host == "youtu.be" || host == "www.youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
 }
 
 fn string_field(object: &Value, name: &str) -> Option<String> {
@@ -121,6 +126,12 @@ fn string_field(object: &Value, name: &str) -> Option<String> {
 
 fn number_field(object: &Value, name: &str) -> Option<f64> {
     object.get(name).and_then(Value::as_f64)
+}
+
+fn safe_http_url(value: Option<String>) -> Option<String> {
+    value.filter(|candidate| Url::parse(candidate)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "https" | "http")))
 }
 
 fn to_video_format(value: &Value) -> Option<VideoFormat> {
@@ -147,10 +158,11 @@ fn to_video_format(value: &Value) -> Option<VideoFormat> {
 
 fn quality_label(height: u32) -> String {
     match height {
-        2160.. => format!("{height}p · 4K"),
-        1440.. => format!("{height}p · 2K"),
-        1080.. => format!("{height}p · Full HD"),
-        720.. => format!("{height}p · HD"),
+        4320 => format!("{height}p · 8K"),
+        2160 => format!("{height}p · 4K"),
+        1440 => format!("{height}p · 2K"),
+        1080 => format!("{height}p · Full HD"),
+        720 => format!("{height}p · HD"),
         _ => format!("{height}p"),
     }
 }
@@ -162,18 +174,19 @@ fn parse_video(url: String, stdout: &[u8]) -> Result<AnalyzedVideo, String> {
     let mut heights: Vec<u32> = formats.iter().filter(|format| format.has_video).filter_map(|format| format.height).collect();
     heights.sort_unstable();
     heights.dedup();
-    let qualities = heights.into_iter().map(|height| QualityOption {
+    let mut qualities: Vec<QualityOption> = heights.into_iter().map(|height| QualityOption {
         height,
         label: quality_label(height),
         video_formats: formats.iter().filter(|format| format.has_video && format.height == Some(height)).cloned().collect(),
     }).collect();
+    qualities.sort_by(|left, right| right.height.cmp(&left.height));
     Ok(AnalyzedVideo {
         id: string_field(&data, "id").ok_or_else(|| "No se pudo determinar el ID del video.".to_owned())?,
         url,
         title: string_field(&data, "title").unwrap_or_else(|| "Video sin título".to_owned()),
         channel: string_field(&data, "channel").or_else(|| string_field(&data, "uploader")),
         duration: number_field(&data, "duration"),
-        thumbnail: string_field(&data, "thumbnail"),
+        thumbnail: safe_http_url(string_field(&data, "thumbnail")),
         qualities,
         formats,
     })
@@ -183,19 +196,26 @@ fn parse_video(url: String, stdout: &[u8]) -> Result<AnalyzedVideo, String> {
 fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>) -> Result<AnalysisResult, String> {
     let paths = engine::EnginePaths::resolve(&app);
     paths.required_for_youtube()?;
-    let binary = paths.yt_dlp.ok_or_else(|| "yt-dlp no está disponible.".to_owned())?;
-    let ffmpeg_directory = paths.ffmpeg.as_ref().and_then(|path| path.parent()).ok_or_else(|| "No se pudo resolver FFmpeg.".to_owned())?.to_path_buf();
+    let binary = paths.yt_dlp.as_ref().ok_or_else(|| "yt-dlp no está disponible.".to_owned())?;
+    let ffmpeg_directory = engine::yt_dlp_ffmpeg_location(&app, &paths)?;
     let deno = paths.deno.ok_or_else(|| "No se pudo resolver Deno.".to_owned())?;
     let mut videos = Vec::new();
     let mut failures = Vec::new();
+    let mut seen_urls = HashSet::new();
+    let mut seen_video_ids = HashSet::new();
     for url in urls {
         let clean_url = url.trim().to_owned();
+        if clean_url.is_empty() { continue; }
+        if !seen_urls.insert(clean_url.clone()) {
+            failures.push(AnalysisFailure { url: clean_url, message: "URL duplicada: se omitió el análisis repetido.".to_owned() });
+            continue;
+        }
         if !is_supported_youtube_url(&clean_url) {
             failures.push(AnalysisFailure { url: clean_url, message: "URL inválida o no compatible. Usá un enlace de YouTube.".to_owned() });
             continue;
         }
         let output = Command::new(&binary)
-            .args(["--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", "--ffmpeg-location"])
+            .args(["--ignore-config", "--no-plugin-dirs", "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", "--ffmpeg-location"])
             .arg(&ffmpeg_directory)
             .arg("--js-runtimes")
             .arg(format!("deno:{}", deno.display()))
@@ -209,7 +229,8 @@ fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>) -> Result<AnalysisResu
             continue;
         }
         match parse_video(clean_url.clone(), &output.stdout) {
-            Ok(video) => videos.push(video),
+            Ok(video) if seen_video_ids.insert(video.id.clone()) => videos.push(video),
+            Ok(_) => failures.push(AnalysisFailure { url: clean_url, message: "El video ya fue analizado mediante otra URL.".to_owned() }),
             Err(message) => failures.push(AnalysisFailure { url: clean_url, message }),
         }
     }
@@ -221,11 +242,62 @@ fn default_download_directory() -> String {
     std::env::var("USERPROFILE").map(|home| format!("{home}\\Downloads")).unwrap_or_else(|_| "Elegí una carpeta de destino".to_owned())
 }
 
+#[tauri::command]
+fn add_download_job(app: tauri::AppHandle, request: download::DownloadRequest) -> Result<download::DownloadJob, String> { download::add(app, request) }
+#[tauri::command]
+fn get_download_queue(app: tauri::AppHandle) -> download::QueueSnapshot { download::get_queue(app) }
+#[tauri::command]
+fn start_download_queue(app: tauri::AppHandle) -> Result<(), String> { download::start(app) }
+#[tauri::command]
+fn start_download_job(app: tauri::AppHandle, job_id: String) -> Result<(), String> { download::start_one(app, job_id) }
+#[tauri::command]
+fn pause_download_queue(app: tauri::AppHandle) { download::pause(app) }
+#[tauri::command]
+fn resume_download_queue(app: tauri::AppHandle) { download::resume(app) }
+#[tauri::command]
+fn cancel_download_job(app: tauri::AppHandle, job_id: String) -> Result<(), String> { download::cancel(app, job_id) }
+#[tauri::command]
+fn cancel_all_downloads(app: tauri::AppHandle) -> Result<(), String> { download::cancel_all(app) }
+#[tauri::command]
+fn retry_download_job(app: tauri::AppHandle, job_id: String) -> Result<(), String> { download::retry(app, job_id) }
+#[tauri::command]
+fn open_download_file(app: tauri::AppHandle, job_id: String) -> Result<(), String> { download::open_file(app, job_id) }
+#[tauri::command]
+fn open_download_folder(app: tauri::AppHandle, job_id: String) -> Result<(), String> { download::open_folder(app, job_id) }
+#[tauri::command]
+fn get_history(app: tauri::AppHandle) -> Result<Vec<history::HistoryEntry>, String> { history::list(&app) }
+#[tauri::command]
+fn remove_history_entry(app: tauri::AppHandle, id: String) -> Result<(), String> { history::remove(&app, &id) }
+
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![check_engines, analyze_urls, default_download_directory])
-        .run(tauri::generate_context!())
-        .expect("error while running YT Download");
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(download::DownloadManager::default())
+        .setup(|app| {
+            history::initialize(&app.handle()).map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            // A process launched by a development host can inherit a minimized
+            // show-state on Windows. Always present the main desktop window.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![check_engines, analyze_urls, default_download_directory, add_download_job, get_download_queue, start_download_queue, start_download_job, pause_download_queue, resume_download_queue, cancel_download_job, cancel_all_downloads, retry_download_job, open_download_file, open_download_folder, get_history, remove_history_entry])
+        .build(tauri::generate_context!())
+        .expect("error while building YT Download");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Ready) {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+    });
 }

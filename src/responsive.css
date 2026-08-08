@@ -1,0 +1,166 @@
+/* The desktop shell should use the actual Tauri window width, not a fixed canvas. */
+html, body, #root { width: 100%; min-width: 0; min-height: 100%; }
+body { min-width: 0; overflow-x: hidden; }
+.app-shell, .workspace, .content-area, .split-grid, .workflow-stack, .bottom-grid, .panel, .section-header { min-width: 0; }
+.app-shell { width: 100%; overflow-x: clip; }
+.content-area { width: 100%; max-width: none; }
+
+.app-header { gap: 18px; padding: 0 clamp(14px, 2vw, 25px); }
+.engines { min-width: 0; height: auto; gap: clamp(12px, 2vw, 28px); margin-right: 0; }
+.engine-badge { min-width: 0; }
+.engine-badge > div { min-width: 0; }
+.engine-badge > div > span { display: block; overflow: hidden; max-width: 230px; text-overflow: ellipsis; white-space: nowrap; }
+.engine-badge.is-active p, .engine-badge.is-active p strong { color: #4ddd72; }
+.engine-badge.is-active > div > span { color: #93cfa1; }
+.engine-badge.is-active .engine-dot { background: #42cc67; border-color: #42cc67; box-shadow: 0 0 8px rgba(66, 204, 103, .38); }
+.engine-badge.is-unavailable p, .engine-badge.is-unavailable p strong { color: #ff5f64; }
+.engine-badge.is-unavailable .engine-dot { background: #ff3c42; border-color: #ff3c42; box-shadow: 0 0 8px rgba(255, 60, 66, .32); }
+.engine-badge.is-checking p, .engine-badge.is-checking p strong { color: #d0d0d0; }
+.engine-badge.is-checking .engine-dot { background: #b8b8b8; border-color: #b8b8b8; }
+.engine-dot.is-active { background: #42cc67; border-color: #42cc67; box-shadow: 0 0 8px rgba(66, 204, 103, .38); }
+.engine-dot.is-unavailable { background: #ff3c42; border-color: #ff3c42; box-shadow: 0 0 8px rgba(255, 60, 66, .32); }
+.engine-dot.is-checking { background: #b8b8b8; border-color: #b8b8b8; }
+
+.workspace { grid-template-columns: clamp(176px, 16.5vw, 214px) minmax(0, 1fr); }
+.split-grid { grid-template-columns: minmax(0, 1.04fr) minmax(360px, .96fr); }
+.bottom-grid { grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr); }
+.video-card, .queue-job, .history-entry { min-width: 0; }
+
+/* A two-column desktop at 1280–1440 still needs compact per-video controls. */
+@media (max-width: 1600px) {
+  .video-card { grid-template-columns: 100px minmax(0, 1fr) auto; grid-template-areas: "thumbnail details remove" "thumbnail quality add" "thumbnail format add"; gap: 7px 10px; padding: 10px 7px; }
+  .video-card > .thumbnail-wrap { grid-area: thumbnail; align-self: stretch; height: auto; min-height: 92px; }
+  .video-card > .video-details { grid-area: details; min-width: 0; }
+  .video-card > .select-field:not(.compact) { grid-area: quality; min-width: 0; }
+  .video-card > .select-field.compact { grid-area: format; min-width: 0; }
+  .video-card > .card-queue-button { grid-area: add; align-self: end; min-width: 70px; }
+  .video-card > .icon-button { grid-area: remove; align-self: start; }
+  .select-field small { display: none; }
+}
+
+@media (max-width: 1280px) {
+  .app-header { height: 64px; }
+  .brand { gap: 9px; }
+  .brand strong { font-size: 18px; }
+  .play-mark { width: 33px; height: 25px; }
+  .engines { gap: 14px; }
+  .engine-badge { gap: 6px; }
+  .engine-badge p { font-size: 12px; }
+  .engine-badge > div > span { max-width: 170px; font-size: 10px; }
+
+  .workspace { grid-template-columns: 176px minmax(0, 1fr); min-height: calc(100vh - 64px); }
+  .sidebar { padding: 13px 11px; }
+  .nav-item { gap: 12px; padding: 14px 12px; font-size: 13px; }
+  .destination-box { right: 11px; bottom: 13px; left: 11px; padding: 10px; }
+  .destination-box button { padding: 8px; }
+  .content-area { padding: 8px; }
+  .url-panel { padding: 14px; }
+  .split-grid { grid-template-columns: minmax(0, 1.05fr) minmax(340px, .95fr); }
+  .section-header { gap: 8px; padding: 12px; }
+  .secondary-button, .subtle-button, .danger-button { padding: 8px; font-size: 11px; }
+
+  .video-card { grid-template-columns: 100px minmax(0, 1fr) auto; grid-template-areas: "thumbnail details remove" "thumbnail quality add" "thumbnail format add"; gap: 7px 10px; padding: 10px 7px; }
+  .video-card > .thumbnail-wrap { grid-area: thumbnail; align-self: stretch; height: auto; min-height: 92px; }
+  .video-card > .video-details { grid-area: details; min-width: 0; }
+  .video-card > .select-field:not(.compact) { grid-area: quality; min-width: 0; }
+  .video-card > .select-field.compact { grid-area: format; min-width: 0; }
+  .video-card > .card-queue-button { grid-area: add; align-self: end; min-width: 70px; }
+  .video-card > .icon-button { grid-area: remove; align-self: start; }
+  .select-field small { display: none; }
+
+  .queue-list { max-height: 445px; }
+  .queue-actions { gap: 5px; }
+  .queue-job, .history-entry { grid-template-columns: 25px 82px minmax(0, 1fr); grid-template-areas: "position thumbnail main" ". thumbnail action"; gap: 8px; padding: 9px 8px 9px 0; }
+  .queue-job > .queue-position, .history-entry > .queue-position { grid-area: position; }
+  .queue-job > .queue-thumb, .history-entry > .queue-thumb { grid-area: thumbnail; }
+  .queue-job > .queue-job-main, .history-entry > .queue-job-main { grid-area: main; }
+  .queue-job > .queue-cancel, .history-entry > .history-remove { grid-area: action; justify-self: end; }
+  .queue-job h3, .history-entry h3 { font-size: 11px; }
+  .job-metrics { gap: 7px; }
+}
+
+@media (max-width: 1080px) {
+  .engines { gap: 10px; }
+  .engine-badge > div > span { max-width: 125px; }
+  .url-entry { grid-template-columns: minmax(0, 1fr) 180px; gap: 12px; }
+  .split-grid { grid-template-columns: minmax(0, 1fr) minmax(330px, .9fr); gap: 8px; }
+  .bottom-grid { grid-template-columns: minmax(0, 1fr) minmax(260px, .8fr); gap: 8px; }
+  .section-header .eyebrow { font-size: 13px; }
+  .queue-actions button { padding-right: 7px; padding-left: 7px; }
+}
+
+@media (max-width: 1120px) {
+  .split-grid { grid-template-columns: minmax(0, 1fr); }
+  .queue-panel { order: -1; min-height: 360px; }
+  .results-panel { order: 0; }
+}
+
+@media (max-width: 980px) {
+  .workspace { grid-template-columns: 78px minmax(0, 1fr); }
+  .sidebar { padding: 12px 9px; }
+  .nav-item { justify-content: center; min-height: 48px; padding: 12px 8px; font-size: 0; }
+  .nav-item svg { width: 21px; height: 21px; }
+  .destination-box { padding: 7px; text-align: center; }
+  .destination-box p, .destination-box span { display: none; }
+  .destination-box button { padding: 7px 4px; font-size: 10px; }
+  .split-grid { grid-template-columns: minmax(0, 1fr); }
+  .queue-panel { min-height: 360px; }
+  .bottom-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .app-header { align-items: center; height: auto; min-height: 58px; padding-top: 8px; padding-bottom: 8px; }
+  .brand small, .engine-badge > div > span { display: none; }
+  .engines { gap: 8px; }
+  .engine-badge p { font-size: 10px; }
+  .engine-badge { min-width: auto; }
+  .url-entry { grid-template-columns: minmax(0, 1fr); }
+  .url-entry .primary-button { min-height: 46px; }
+  .section-header { align-items: stretch; flex-wrap: wrap; }
+  .section-header > div { min-width: 0; }
+  .section-header > .secondary-button { width: 100%; }
+  .queue-actions { width: 100%; }
+  .queue-actions button { flex: 1; justify-content: center; }
+  .bottom-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* The download flow is intentionally sequential: analyse, queue, then download. */
+.workflow-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-top: 10px; }
+.workflow-stack .results-panel, .workflow-stack .queue-panel { min-height: 0; }
+.workflow-stack .queue-panel { order: 0; min-height: 360px; }
+.workflow-stack .queue-list { max-height: min(58vh, 540px); }
+
+.download-stage { margin-top: 10px; }
+.download-stage-heading { display: flex; align-items: center; min-height: 34px; padding: 0 3px 8px; }
+.download-stage-heading span { color: #8f8f8f; font-size: 11px; }
+.download-stage .bottom-grid { margin-top: 0; }
+
+.card-queue-button { white-space: normal; line-height: 1.15; text-align: center; }
+.download-one-button { display: inline-flex; align-items: center; gap: 6px; margin-top: 7px; padding: 7px 9px; color: #ff7474; border: 1px solid rgba(237, 39, 39, .52); border-radius: 4px; background: rgba(129, 17, 17, .16); font-size: 10px; font-weight: 700; }
+.download-one-button:not(:disabled):hover { color: #fff; border-color: #f04040; background: rgba(179, 19, 19, .42); }
+
+@media (max-width: 1120px) {
+  .workflow-stack .queue-panel { order: 0; }
+}
+
+@media (max-width: 760px) {
+  .download-stage-heading { align-items: flex-start; }
+  .download-stage-heading span { display: block; margin-top: 4px; }
+  .queue-footer { align-items: stretch; flex-wrap: wrap; gap: 10px; }
+  .queue-footer > span { width: 100%; }
+  .queue-footer .primary-button { width: 100%; }
+}
+
+.update-panel { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 16px; margin-bottom: 10px; padding: 15px; border: 1px solid rgba(80, 198, 110, .25); border-radius: 7px; background: linear-gradient(120deg, rgba(43, 105, 57, .22), rgba(24, 24, 24, .94)); box-shadow: 0 10px 27px rgba(0, 0, 0, .15); }
+.update-panel > div:first-child { min-width: 0; }
+.update-panel > div:first-child > span { display: block; margin-top: 5px; color: #9ca99f; font-size: 11px; }
+.update-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.update-message { grid-column: 1 / -1; margin: 0; color: #a8c8ae; font-size: 12px; line-height: 1.45; }
+.update-message.available { color: #75dc86; }
+.update-message.error { color: #ef8a8a; }
+
+@media (max-width: 760px) {
+  .update-panel { grid-template-columns: minmax(0, 1fr); }
+  .update-actions { justify-content: stretch; flex-wrap: wrap; }
+  .update-actions button { flex: 1 1 180px; justify-content: center; }
+}
