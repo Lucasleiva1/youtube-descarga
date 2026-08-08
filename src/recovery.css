@@ -1,0 +1,16 @@
+.youtube-recovery {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 13px;
+  border: 1px solid rgba(232, 177, 57, .48);
+  border-radius: 6px;
+  color: #e8c779;
+  background: linear-gradient(100deg, rgba(121, 80, 10, .28), rgba(34, 29, 18, .9));
+}
+
+.youtube-recovery > svg { flex: 0 0 auto; margin-top: 1px; }
+.youtube-recovery strong { display: block; color: #ffe2a1; font-size: 12px; }
+.youtube-recovery p { margin: 4px 0 10px; color: #d2c09a; font-size: 11px; line-height: 1.45; }
+.youtube-recovery div div { display: flex; flex-wrap: wrap; gap: 7px; }
+.youtube-recovery .secondary-button { border-color: rgba(240, 191, 77, .5); color: #ffe9b7; background: #41331c; }

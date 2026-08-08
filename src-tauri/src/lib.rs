@@ -71,14 +71,17 @@ struct AnalyzedVideo {
     duration: Option<f64>,
     thumbnail: Option<String>,
     browser_session: Option<String>,
+    use_pot_provider: bool,
     qualities: Vec<QualityOption>,
     formats: Vec<VideoFormat>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AnalysisFailure {
     url: String,
     message: String,
+    requires_browser_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,16 +150,83 @@ fn browser_session_name(value: Option<&str>) -> Result<Option<&'static str>, Str
     }
 }
 
-/// The public Android VR client exposes direct source formats without needing
-/// any account. If the user explicitly opts in to a local browser session, use
-/// a cookie-compatible client and the session stays local to that browser.
-fn configure_youtube_access(command: &mut Command, browser_session: Option<&str>) {
+/// In public mode, defer to the current yt-dlp defaults instead of pinning a
+/// single YouTube client. YouTube changes client availability frequently and
+/// yt-dlp can choose the current supported public clients. When the user
+/// explicitly opts in to a local browser session, yt-dlp reads it directly
+/// from that browser; the application never stores or exports cookies.
+pub(crate) fn configure_youtube_access(command: &mut Command, browser_session: Option<&str>) {
     if let Some(browser) = browser_session {
-        command.arg("--cookies-from-browser").arg(browser)
-            .arg("--extractor-args").arg("youtube:player_client=web_safari");
-    } else {
-        command.arg("--extractor-args").arg("youtube:player_client=android_vr");
+        command.arg("--cookies-from-browser").arg(browser);
     }
+}
+
+fn browser_label(browser_session: Option<&str>) -> &'static str {
+    match browser_session {
+        Some("chrome") => "Chrome",
+        Some("edge") => "Edge",
+        _ => "el navegador elegido",
+    }
+}
+
+fn alternate_browser_hint(browser_session: Option<&str>) -> &'static str {
+    match browser_session {
+        Some("chrome") => "Probá con Edge, cerrándolo por completo antes de reintentar.",
+        Some("edge") => "Probá con Chrome si es el navegador donde tenés iniciada tu sesión de YouTube.",
+        _ => "Elegí el navegador donde tenés iniciada tu sesión de YouTube.",
+    }
+}
+
+pub(crate) fn youtube_requires_browser_session(technical: &str) -> bool {
+    technical.to_ascii_lowercase().contains("sign in to confirm")
+}
+
+/// Converts known yt-dlp/YouTube failures into short, safe messages for the
+/// UI. In particular, do not surface browser profile paths, cookie details or
+/// command diagnostics. The app deliberately does not attempt to bypass
+/// Windows/Chromium credential protection.
+pub(crate) fn youtube_failure_message(technical: &str, browser_session: Option<&str>) -> Option<String> {
+    let lower = technical.to_ascii_lowercase();
+    let browser = browser_label(browser_session);
+
+    if lower.contains("could not copy chrome cookie database")
+        || (lower.contains("permission denied") && lower.contains("cookie")) {
+        return Some(format!(
+            "No se pudo leer la sesión de {browser} porque el navegador mantiene sus datos en uso. Cerralo por completo y reintentá. La aplicación no guardó ni exportó cookies."
+        ));
+    }
+    if lower.contains("failed to decrypt with dpapi")
+        || lower.contains("could not decrypt cookies")
+        || lower.contains("could not decrypt with dpapi") {
+        return Some(format!(
+            "{browser} protegió esa sesión con el cifrado de Windows y la aplicación no puede leerla. Para cuidar tu cuenta, no intenta evitar esa protección ni guarda cookies. {}",
+            alternate_browser_hint(browser_session)
+        ));
+    }
+    if lower.contains("could not find") && lower.contains("cookies database") {
+        return Some(format!(
+            "No se encontró un perfil utilizable de {browser}. {}",
+            alternate_browser_hint(browser_session)
+        ));
+    }
+    if youtube_requires_browser_session(technical) {
+        return Some(match browser_session {
+            Some(_) => format!(
+                "YouTube no aceptó la sesión de {browser} para este video. Confirmá que estás conectado a YouTube en ese navegador y reintentá."
+            ),
+            None => "YouTube necesita una sesión local para verificar este video.".to_owned(),
+        });
+    }
+    if lower.contains("private video") {
+        return Some("El video es privado.".to_owned());
+    }
+    if lower.contains("video unavailable") || lower.contains("this video is not available") {
+        return Some("El video no está disponible.".to_owned());
+    }
+    if lower.contains("requested format is not available") {
+        return Some("La fuente ya no ofrece el formato original elegido. Volvé a analizar el enlace; la aplicación no descargó una resolución inferior.".to_owned());
+    }
+    None
 }
 
 fn string_field(object: &Value, name: &str) -> Option<String> {
@@ -289,9 +359,29 @@ fn parse_video(url: String, stdout: &[u8]) -> Result<AnalyzedVideo, String> {
         duration: number_field(&data, "duration"),
         thumbnail: safe_http_url(string_field(&data, "thumbnail")),
         browser_session: None,
+        use_pot_provider: false,
         qualities,
         formats,
     })
+}
+
+fn analysis_command(
+    binary: &std::path::Path,
+    ffmpeg_directory: &std::path::Path,
+    deno: &std::path::Path,
+    browser_session: Option<&str>,
+    provider: Option<&engine::PotProviderPaths>,
+) -> Command {
+    let mut command = hidden_command(binary);
+    command.args(["--ignore-config", "--no-plugin-dirs", "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", "--ffmpeg-location"])
+        .arg(ffmpeg_directory)
+        .arg("--js-runtimes")
+        .arg(format!("deno:{}", deno.display()));
+    configure_youtube_access(&mut command, browser_session);
+    if let Some(provider) = provider {
+        engine::configure_pot_provider(&mut command, provider);
+    }
+    command
 }
 
 #[tauri::command]
@@ -300,7 +390,7 @@ fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>, browser_session: Optio
     paths.required_for_youtube()?;
     let binary = paths.yt_dlp.as_ref().ok_or_else(|| "yt-dlp no está disponible.".to_owned())?;
     let ffmpeg_directory = engine::yt_dlp_ffmpeg_location(&app, &paths)?;
-    let deno = paths.deno.ok_or_else(|| "No se pudo resolver Deno.".to_owned())?;
+    let deno = paths.deno.as_ref().ok_or_else(|| "No se pudo resolver Deno.".to_owned())?;
     let browser_session = browser_session_name(browser_session.as_deref())?.map(ToOwned::to_owned);
     let mut videos = Vec::new();
     let mut failures = Vec::new();
@@ -310,35 +400,58 @@ fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>, browser_session: Optio
         let clean_url = url.trim().to_owned();
         if clean_url.is_empty() { continue; }
         if !seen_urls.insert(clean_url.clone()) {
-            failures.push(AnalysisFailure { url: clean_url, message: "URL duplicada: se omitió el análisis repetido.".to_owned() });
+            failures.push(AnalysisFailure { url: clean_url, message: "URL duplicada: se omitió el análisis repetido.".to_owned(), requires_browser_session: false });
             continue;
         }
         if !is_supported_youtube_url(&clean_url) {
-            failures.push(AnalysisFailure { url: clean_url, message: "URL inválida o no compatible. Usá un enlace de YouTube.".to_owned() });
+            failures.push(AnalysisFailure { url: clean_url, message: "URL inválida o no compatible. Usá un enlace de YouTube.".to_owned(), requires_browser_session: false });
             continue;
         }
-        let mut command = hidden_command(&binary);
-        command.args(["--ignore-config", "--no-plugin-dirs", "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", "--ffmpeg-location"])
-            .arg(&ffmpeg_directory)
-            .arg("--js-runtimes")
-            .arg(format!("deno:{}", deno.display()));
-        configure_youtube_access(&mut command, browser_session.as_deref());
-        let output = command.arg(&clean_url)
+        let mut command = analysis_command(binary, &ffmpeg_directory, deno, browser_session.as_deref(), None);
+        let mut output = command.arg(&clean_url)
             .output()
             .map_err(|_| "yt-dlp no está disponible. Instalalo o agregalo a los binarios de la aplicación.".to_owned())?;
+        let mut used_pot_provider = false;
+        let mut pot_attempted = false;
+        if !output.status.success()
+            && browser_session.is_none()
+            && youtube_requires_browser_session(&String::from_utf8_lossy(&output.stderr))
+        {
+            pot_attempted = true;
+            match engine::ensure_pot_provider(&app, &paths) {
+                Ok(provider) => {
+                    let mut retry = analysis_command(binary, &ffmpeg_directory, deno, None, Some(&provider));
+                    output = retry.arg(&clean_url)
+                        .output()
+                        .map_err(|_| "yt-dlp no está disponible. Instalalo o agregalo a los binarios de la aplicación.".to_owned())?;
+                    used_pot_provider = output.status.success();
+                }
+                Err(message) => {
+                    failures.push(AnalysisFailure { url: clean_url, message, requires_browser_session: false });
+                    continue;
+                }
+            }
+        }
         if !output.status.success() {
             let technical = String::from_utf8_lossy(&output.stderr);
-            let message = if technical.contains("Private video") { "El video es privado." } else if technical.contains("Video unavailable") { "El video no está disponible." } else if technical.contains("Sign in to confirm") && browser_session.is_none() { "YouTube pidió una verificación anti-bot. En Configuración elegí usar tu sesión local de Chrome o Edge y volvé a analizar; la app no guarda credenciales." } else if technical.contains("Sign in to confirm") { "YouTube sigue rechazando esta sesión local. Confirmá que tenés YouTube abierto en el navegador seleccionado y reintentá." } else { "No se pudo obtener la información del video." };
-            failures.push(AnalysisFailure { url: clean_url, message: message.to_owned() });
+            let requires_browser_session = !pot_attempted && youtube_requires_browser_session(&technical);
+            let message = if pot_attempted {
+                "El verificador local de YouTube no pudo validar este enlace. Comprobá tu conexión y reintentá.".to_owned()
+            } else {
+                youtube_failure_message(&technical, browser_session.as_deref())
+                    .unwrap_or_else(|| "No se pudo obtener la información del video.".to_owned())
+            };
+            failures.push(AnalysisFailure { url: clean_url, message, requires_browser_session });
             continue;
         }
         match parse_video(clean_url.clone(), &output.stdout) {
             Ok(mut video) if seen_video_ids.insert(video.id.clone()) => {
                 video.browser_session = browser_session.clone();
+                video.use_pot_provider = used_pot_provider;
                 videos.push(video);
             },
-            Ok(_) => failures.push(AnalysisFailure { url: clean_url, message: "El video ya fue analizado mediante otra URL.".to_owned() }),
-            Err(message) => failures.push(AnalysisFailure { url: clean_url, message }),
+            Ok(_) => failures.push(AnalysisFailure { url: clean_url, message: "El video ya fue analizado mediante otra URL.".to_owned(), requires_browser_session: false }),
+            Err(message) => failures.push(AnalysisFailure { url: clean_url, message, requires_browser_session: false }),
         }
     }
     Ok(AnalysisResult { videos, failures })
@@ -380,7 +493,7 @@ fn remove_history_entry(app: tauri::AppHandle, id: String) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
-    use super::parse_video;
+    use super::{parse_video, youtube_failure_message, youtube_requires_browser_session};
     use serde_json::json;
 
     #[test]
@@ -410,6 +523,32 @@ mod tests {
         });
         let video = parse_video("https://www.youtube.com/watch?v=cinema".to_owned(), metadata.to_string().as_bytes()).expect("metadata should parse");
         assert_eq!(video.qualities[0].label, "720p (1280 × 640 px)");
+    }
+
+    #[test]
+    fn explains_when_a_chromium_cookie_database_is_locked_without_exposing_it() {
+        let message = youtube_failure_message(
+            "ERROR: Could not copy Chrome cookie database. Permission denied: C:\\Users\\person\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Network\\Cookies",
+            Some("edge"),
+        ).expect("known browser lock should have a safe message");
+        assert!(message.contains("Edge"));
+        assert!(message.contains("Cerralo por completo"));
+        assert!(!message.contains("C:\\Users"));
+        assert!(!message.contains("Network\\Cookies"));
+    }
+
+    #[test]
+    fn explains_dpapi_protection_without_claiming_to_bypass_it() {
+        let message = youtube_failure_message("ERROR: Failed to decrypt with DPAPI", Some("chrome"))
+            .expect("DPAPI failure should have a safe message");
+        assert!(message.contains("Chrome"));
+        assert!(message.contains("no intenta evitar esa protección"));
+    }
+
+    #[test]
+    fn keeps_the_browser_recovery_flag_for_youtube_antibot_challenges() {
+        assert!(youtube_requires_browser_session("ERROR: Sign in to confirm you’re not a bot"));
+        assert!(!youtube_requires_browser_session("ERROR: Could not copy Chrome cookie database"));
     }
 }
 

@@ -42,6 +42,8 @@ export interface AnalyzedVideo {
   thumbnail?: string;
   /** Browser session explicitly chosen when this source was analyzed. */
   browserSession?: BrowserSession | null;
+  /** True only when the source needed the bundled local YouTube verifier. */
+  usePotProvider: boolean;
   qualities: QualityOption[];
   formats: VideoFormat[];
 }
@@ -49,6 +51,8 @@ export interface AnalyzedVideo {
 export interface AnalysisFailure {
   url: string;
   message: string;
+  /** True only when YouTube requests anti-bot verification. */
+  requiresBrowserSession: boolean;
 }
 
 export interface AnalysisResult {
@@ -93,6 +97,7 @@ export interface AddDownloadJobRequest {
   selectedFormatHasAudio: boolean | null;
   compatibilityMode: boolean;
   browserSession?: BrowserSession | null;
+  usePotProvider: boolean;
   container: DownloadContainer;
   destination: string;
 }

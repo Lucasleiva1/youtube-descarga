@@ -1,4 +1,4 @@
-use crate::{engine, hidden_command, history};
+use crate::{configure_youtube_access, engine, hidden_command, history, youtube_failure_message};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -36,7 +36,7 @@ pub struct DownloadVerification { pub width: Option<u32>, pub height: Option<u32
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRequest {
     pub video_id: String, pub url: String, pub title: String, pub thumbnail: Option<String>, pub channel: Option<String>,
-    pub quality_height: Option<u32>, pub selected_format_id: Option<String>, pub selected_format_has_audio: Option<bool>, #[serde(default)] pub compatibility_mode: bool, #[serde(default)] pub browser_session: Option<String>, pub container: String, pub destination: String,
+    pub quality_height: Option<u32>, pub selected_format_id: Option<String>, pub selected_format_has_audio: Option<bool>, #[serde(default)] pub compatibility_mode: bool, #[serde(default)] pub browser_session: Option<String>, #[serde(default)] pub use_pot_provider: bool, pub container: String, pub destination: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +103,7 @@ pub fn add(app: AppHandle, request: DownloadRequest) -> Result<DownloadJob, Stri
     if !valid_container(&request.container) { return Err("Contenedor no válido.".to_owned()); }
     if request.selected_format_id.as_deref().is_some_and(|format_id| !valid_format_id(format_id)) { return Err("El formato seleccionado no es válido.".to_owned()); }
     if !valid_browser_session(request.browser_session.as_deref()) { return Err("El navegador seleccionado no es compatible.".to_owned()); }
+    if request.use_pot_provider && request.browser_session.is_some() { return Err("La verificación local y una sesión de navegador no se pueden combinar.".to_owned()); }
     if request.video_id.trim().is_empty() || request.url.trim().is_empty() || request.destination.trim().is_empty() { return Err("Faltan datos para agregar la descarga a la cola.".to_owned()); }
     if !valid_youtube_url(&request.url) { return Err("La URL no es un enlace de YouTube válido.".to_owned()); }
     if app.state::<DownloadManager>().state.lock().map_err(|_| "No se pudo bloquear la cola.".to_owned())?
@@ -248,16 +249,19 @@ fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
     let destination = output_directory(job)?;
     let binary = paths.yt_dlp.as_ref().ok_or_else(|| "yt-dlp no está disponible.".to_owned())?;
     let ffmpeg_directory = engine::yt_dlp_ffmpeg_location(app, &paths)?;
-    let deno = paths.deno.ok_or_else(|| "Deno no está disponible.".to_owned())?;
+    let deno = paths.deno.as_ref().ok_or_else(|| "Deno no está disponible.".to_owned())?;
+    let pot_provider = if job.request.use_pot_provider {
+        Some(engine::ensure_pot_provider(app, &paths)?)
+    } else {
+        None
+    };
     let mut command = hidden_command(binary);
     command.args(["--ignore-config", "--no-plugin-dirs", "--no-playlist", "--newline", "--progress", "--windows-filenames", "--trim-filenames", "180", "--no-overwrites", "--paths"])
         .arg(&destination).arg("--output").arg("%(title)s [%(height)sp].%(ext)s")
         .arg("--ffmpeg-location").arg(ffmpeg_directory).arg("--js-runtimes").arg(format!("deno:{}", deno.display()));
-    if let Some(browser) = job.request.browser_session.as_deref() {
-        command.arg("--cookies-from-browser").arg(browser)
-            .arg("--extractor-args").arg("youtube:player_client=web_safari");
-    } else {
-        command.arg("--extractor-args").arg("youtube:player_client=android_vr");
+    configure_youtube_access(&mut command, job.request.browser_session.as_deref());
+    if let Some(provider) = pot_provider.as_ref() {
+        engine::configure_pot_provider(&mut command, provider);
     }
     command
         .arg("--format").arg(format_selector(job))
@@ -279,7 +283,16 @@ fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
     let _ = stdout_reader.join(); let _ = stderr_reader.join();
     app.state::<DownloadManager>().processes.lock().ok().and_then(|mut processes| processes.remove(&job.job_id));
     if find_job(app, &job.job_id).is_some_and(|current| current.status == DownloadStatus::Cancelled) { return Err("Descarga cancelada.".to_owned()); }
-    if !exit.success() { return Err(diagnostics.lock().ok().map(|log| log.trim().to_owned()).filter(|text| !text.is_empty()).unwrap_or_else(|| "yt-dlp no pudo completar la descarga.".to_owned())); }
+    if !exit.success() {
+        let diagnostic = diagnostics.lock().ok().map(|log| log.trim().to_owned()).unwrap_or_default();
+        if job.request.use_pot_provider && crate::youtube_requires_browser_session(&diagnostic) {
+            return Err("El verificador local de YouTube no pudo validar este enlace. Comprobá la conexión y reintentá.".to_owned());
+        }
+        if let Some(message) = youtube_failure_message(&diagnostic, job.request.browser_session.as_deref()) {
+            return Err(message);
+        }
+        return Err((!diagnostic.is_empty()).then_some(diagnostic).unwrap_or_else(|| "yt-dlp no pudo completar la descarga.".to_owned()));
+    }
     let file = final_path.lock().ok().and_then(|path| path.clone()).ok_or_else(|| "yt-dlp no informó la ruta final del archivo.".to_owned())?;
     let canonical_file = file.canonicalize().map_err(|error| format!("No se pudo localizar el archivo final: {error}"))?;
     if !canonical_file.starts_with(&destination) { return Err("La ruta final no pertenece a la carpeta seleccionada.".to_owned()); }
