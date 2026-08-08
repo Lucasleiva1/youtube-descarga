@@ -3,54 +3,43 @@ import { strerror, VERSION } from "./utils.ts";
 import { Command } from "commander";
 import express from "express";
 
-const program = new Command().option("-p, --port <PORT>").parse();
+const program = new Command()
+    .option("-p, --port <PORT>")
+    .option("--host <HOST>")
+    .parse();
 
 const options = program.opts();
 
 const PORT_NUMBER = options.port || 4416;
+// This provider is embedded in a desktop application. It must never expose
+// its cache or token-minting endpoints to the local network.
+const HOST = options.host || "127.0.0.1";
 
 const httpServer = express();
+// yt-dlp is a native HTTP client and does not send browser navigation headers.
+// Reject them so an unrelated web page cannot use this loopback-only service
+// as a cross-site token-minting endpoint.
+httpServer.use((request, response, next) => {
+    if (request.headers.origin || request.headers.referer) {
+        response.status(403).send({ error: "Browser requests are not allowed" });
+        return;
+    }
+    next();
+});
 httpServer.use(express.json());
 httpServer.use(express.urlencoded({ extended: true }));
 
 httpServer
-    .listen(
-        {
-            host: "::",
-            port: PORT_NUMBER,
-        },
-        (err) => {
-            if (err) {
-                console.error(
-                    `Could not listen on [::]:${PORT_NUMBER}, falling back to 0.0.0.0 (Caused by ${strerror(err)})`,
-                );
-            } else {
-                console.log(
-                    `Started POT server (v${VERSION}) on on address [::]:${PORT_NUMBER}`,
-                );
-            }
-        },
-    )
-    .on("error", () => {
-        // ipv4 only systems might not be able to bind to "::", so we try 0.0.0.0 instead
-        // this is temporary as we plan to bind to localhost in the next major version
-        httpServer.listen(
-            {
-                host: "0.0.0.0",
-                port: PORT_NUMBER,
-            },
-            (err) => {
-                if (err) {
-                    console.error(
-                        `Could not listen on [::]:${PORT_NUMBER} (Caused by ${strerror(err)})`,
-                    );
-                } else {
-                    console.log(
-                        `Started POT server (v${VERSION}) on address 0.0.0.0:${PORT_NUMBER}`,
-                    );
-                }
-            },
+    .listen({ host: HOST, port: PORT_NUMBER }, () => {
+        console.log(
+            `Started POT server (v${VERSION}) on address ${HOST}:${PORT_NUMBER}`,
         );
+    })
+    .on("error", (err) => {
+        console.error(
+            `Could not listen on ${HOST}:${PORT_NUMBER} (Caused by ${strerror(err)})`,
+        );
+        process.exit(1);
     });
 
 const sessionManager = new SessionManager();

@@ -33,7 +33,6 @@ import type {
   AnalysisFailure,
   AnalysisResult,
   AnalyzedVideo,
-  BrowserSession,
   DownloadContainer,
   DownloadEvent,
   DownloadJob,
@@ -45,17 +44,8 @@ import type {
 } from "../types/download";
 
 const defaultDestination = "Elegí una carpeta de destino";
-type YoutubeAccessMode = "public" | BrowserSession;
-const youtubeAccessModeStorageKey = "yt-download.youtube-access-mode";
+const legacyYoutubeAccessModeStorageKey = "yt-download.youtube-access-mode";
 
-function savedYoutubeAccessMode(): YoutubeAccessMode {
-  try {
-    const value = window.localStorage.getItem(youtubeAccessModeStorageKey);
-    return value === "chrome" || value === "edge" ? value : "public";
-  } catch {
-    return "public";
-  }
-}
 function defaultSelectionFor(video: AnalyzedVideo): DownloadSelection {
   const highestQuality = video.qualities[0];
   return {
@@ -359,9 +349,13 @@ export function App() {
   const [updateMessage, setUpdateMessage] = useState<string>();
   const [isUpdatePromptOpen, setUpdatePromptOpen] = useState(false);
   const [appVersion, setAppVersion] = useState<string>();
-  const [youtubeAccessMode, setYoutubeAccessMode] = useState<YoutubeAccessMode>(savedYoutubeAccessMode);
 
   useEffect(() => {
+    try {
+      window.localStorage.removeItem(legacyYoutubeAccessModeStorageKey);
+    } catch {
+      // A blocked storage API must not prevent the application from starting.
+    }
     void getVersion().then(setAppVersion).catch(() => undefined);
     void invoke<EngineInfo[]>("check_engines")
       .then(setEngines)
@@ -430,17 +424,7 @@ export function App() {
     return Math.round(((completed + activePercent / 100) / jobs.length) * 100);
   }, [activeJob?.progress.percent, jobs]);
   const hasDestination = Boolean(destination) && destination !== defaultDestination;
-  const browserRecoveryFailure = analysisFailures.find((failure) => failure.requiresBrowserSession);
-
-  function selectYoutubeAccessMode(mode: YoutubeAccessMode) {
-    setYoutubeAccessMode(mode);
-    try {
-      if (mode === "public") window.localStorage.removeItem(youtubeAccessModeStorageKey);
-      else window.localStorage.setItem(youtubeAccessModeStorageKey, mode);
-    } catch {
-      // The selection still applies for the current application session.
-    }
-  }
+  const accountAccessFailure = analysisFailures.find((failure) => failure.requiresBrowserSession);
 
   async function refreshQueue() {
     try {
@@ -450,7 +434,7 @@ export function App() {
     }
   }
 
-  async function analyzeVideos(accessMode: YoutubeAccessMode = youtubeAccessMode) {
+  async function analyzeVideos() {
     setError(undefined);
     setNotice(undefined);
     setAnalysisFailures([]);
@@ -464,10 +448,7 @@ export function App() {
     }
     setAnalyzing(true);
     try {
-      const result = await invoke<AnalysisResult>("analyze_urls", {
-        urls: uniqueUrls,
-        browserSession: accessMode === "public" ? null : accessMode,
-      });
+      const result = await invoke<AnalysisResult>("analyze_urls", { urls: uniqueUrls });
       setVideos(result.videos);
       setAnalysisFailures(result.failures);
       if (result.videos.length > 0) setNotice(`${result.videos.length} video${result.videos.length === 1 ? "" : "s"} analizado${result.videos.length === 1 ? "" : "s"}. Elegí la calidad y agregalo a la cola.`);
@@ -568,6 +549,12 @@ export function App() {
   }
 
   async function installUpdate() {
+    if (activeJobs.length > 0 || waitingJobs.length > 0) {
+      setUpdatePromptOpen(false);
+      setUpdaterState("available");
+      setUpdateMessage("Terminá o cancelá las descargas activas y pendientes antes de actualizar. No se interrumpió ningún archivo.");
+      return;
+    }
     const update = pendingUpdateRef.current;
     if (!update) {
       await checkForUpdates();
@@ -610,6 +597,7 @@ export function App() {
       selectedFormatId: selection.selectedFormatId,
       selectedFormatHasAudio: selection.selectedFormatHasAudio,
       compatibilityMode: selection.compatibilityMode,
+      accessStrategy: video.accessStrategy,
       browserSession: video.browserSession ?? null,
       usePotProvider: video.usePotProvider,
       container: selection.container,
@@ -805,7 +793,7 @@ export function App() {
               </div>
               {error && <p className="message error"><XCircle size={16} />{error}</p>}
               {notice && <p className="message success"><CheckCircle2 size={16} />{notice}</p>}
-              {browserRecoveryFailure && <div className="youtube-recovery"><Info size={18} /><div><strong>SE NECESITA UNA SESIÓN DE YOUTUBE</strong><p>{browserRecoveryFailure.message}</p><ol className="youtube-recovery-steps"><li>Abrí <strong>Configuración</strong>.</li><li>En <strong>Acceso a YouTube</strong>, elegí Chrome o Edge donde ya usás YouTube.</li><li>Volvé a <strong>Descargas</strong> y presioná <strong>Analizar videos</strong>.</li></ol><button className="secondary-button" disabled={isAnalyzing} onClick={() => setActiveView("settings")}>IR A CONFIGURACIÓN</button></div></div>}
+              {accountAccessFailure && <div className="youtube-recovery"><Info size={18} /><div><strong>ESTE CONTENIDO REQUIERE UNA CUENTA DE YOUTUBE</strong><p>{accountAccessFailure.message}</p><p>La app ya probó automáticamente los accesos disponibles. Iniciá sesión en YouTube en un navegador compatible y volvé a analizar el enlace.</p><button className="secondary-button" disabled={isAnalyzing} onClick={() => void analyzeVideos()}><RotateCcw size={14} />VOLVER A ANALIZAR</button></div></div>}
               {analysisFailures.filter((failure) => !failure.requiresBrowserSession).length > 0 && <div className="analysis-failures">{analysisFailures.filter((failure) => !failure.requiresBrowserSession).map((failure, index) => <p key={`${failure.url}-${index}`}><XCircle size={14} /><span>{failure.url}</span>{failure.message}</p>)}</div>}
               {!engineReady && <p className="engine-warning"><Info size={15} /> Para analizar y descargar, yt-dlp, FFmpeg, ffprobe y Deno deben estar activos.</p>}
             </section>
@@ -836,7 +824,7 @@ export function App() {
               <article className="panel progress-panel"><p className="eyebrow">PROGRESO GENERAL</p><div className="progress-idle"><span>{queueProgress}%</span><div><i style={{ width: `${queueProgress}%` }} /></div><small>{jobs.length === 0 ? "No hay descargas activas" : `${completedJobs.length} de ${jobs.length} trabajo${jobs.length === 1 ? "" : "s"} completado${completedJobs.length === 1 ? "" : "s"}`}</small></div></article>
               </div>
             </section>
-          </> : activeView === "settings" ? <section className="panel diagnostics-panel"><header><div><h1>CONFIGURACIÓN</h1><p>DIAGNÓSTICO DEL MOTOR</p></div><button className="secondary-button" onClick={() => void refreshEngines()}><LoaderCircle size={16} />VOLVER A COMPROBAR</button></header><section className="youtube-access-setting"><div><strong>ACCESO A YOUTUBE</strong><p>Usá <strong>Solo acceso público</strong> normalmente. La app primero intenta una verificación local automática; elegí Chrome o Edge sólo si en Descargas aparece un aviso indicándotelo. La app no guarda, copia ni muestra contraseñas o cookies.</p></div><label className="select-field"><span>Sesión para YouTube</span><div className="select-wrap"><select aria-label="Sesión local para YouTube" value={youtubeAccessMode} onChange={(event) => selectYoutubeAccessMode(event.target.value as YoutubeAccessMode)}><option value="public">SOLO ACCESO PÚBLICO</option><option value="chrome">USAR SESIÓN LOCAL DE CHROME</option><option value="edge">USAR SESIÓN LOCAL DE EDGE</option></select><ChevronDown size={15} /></div><small>Elegí el navegador donde ya usás YouTube; después volvé a Descargas y analizá el enlace de nuevo.</small></label></section><div className="diagnostic-list">{engines.map((engine) => <article key={engine.name}><span className={engine.state === "available" ? "engine-dot is-active" : engine.state === "checking" ? "engine-dot is-checking" : "engine-dot is-unavailable"} /><div><strong>{engine.name}</strong><p>Estado: {engine.state === "available" ? "Activo" : engine.state === "checking" ? "Comprobando" : "No disponible"}</p><p>Versión: {engine.version ?? "—"}</p><p className="diagnostic-path">Ruta: {engine.path ?? engine.detail ?? "—"}</p></div></article>)}</div></section> : activeView === "history" ? <section className="panel history-panel"><header className="section-header"><div><p className="eyebrow">HISTORIAL RECIENTE</p><span>Descargas persistidas localmente.</span></div></header>{history.length === 0 ? <div className="queue-empty"><History size={27} /><strong>SIN DESCARGAS COMPLETADAS</strong><span>Cuando una descarga termine correctamente,<br />aparecerá aquí incluso después de reiniciar.</span></div> : <div className="queue-list">{history.map((entry, index) => <HistoryEntryCard key={entry.id} entry={entry} position={index + 1} onOpenFile={() => void openFile(entry.id)} onOpenFolder={() => void openFolder(entry.id)} onRemove={() => void removeHistoryEntry(entry.id)} />)}</div>}</section> : <section className="panel secondary-view"><h1>ACERCA DE</h1><p>YT Download usa yt-dlp, FFmpeg, ffprobe y Deno empaquetados localmente para analizar y procesar tus descargas.</p><FolderOpen size={28} /></section>}
+          </> : activeView === "settings" ? <section className="panel diagnostics-panel"><header><div><h1>CONFIGURACIÓN</h1><p>DIAGNÓSTICO DEL MOTOR</p></div><button className="secondary-button" onClick={() => void refreshEngines()}><LoaderCircle size={16} />VOLVER A COMPROBAR</button></header><section className="youtube-access-setting"><div><strong>ACCESO AUTOMÁTICO A YOUTUBE</strong><p>La app elige el acceso adecuado para cada enlace. Los videos públicos se analizan sin leer ni tocar sesiones de tus navegadores. Solo busca una sesión local compatible cuando YouTube confirma que el contenido realmente requiere una cuenta.</p></div><div className="youtube-access-order" aria-label="Orden automático de acceso a YouTube"><span>ORDEN AUTOMÁTICO</span><ol><li>Acceso público</li><li>Verificación local incluida</li><li>Sesión compatible, solo si hace falta una cuenta</li></ol></div></section><div className="diagnostic-list">{engines.map((engine) => <article key={engine.name}><span className={engine.state === "available" ? "engine-dot is-active" : engine.state === "checking" ? "engine-dot is-checking" : "engine-dot is-unavailable"} /><div><strong>{engine.name}</strong><p>Estado: {engine.state === "available" ? "Activo" : engine.state === "checking" ? "Comprobando" : "No disponible"}</p><p>Versión: {engine.version ?? "—"}</p><p className="diagnostic-path">Ruta: {engine.path ?? engine.detail ?? "—"}</p></div></article>)}</div></section> : activeView === "history" ? <section className="panel history-panel"><header className="section-header"><div><p className="eyebrow">HISTORIAL RECIENTE</p><span>Descargas persistidas localmente.</span></div></header>{history.length === 0 ? <div className="queue-empty"><History size={27} /><strong>SIN DESCARGAS COMPLETADAS</strong><span>Cuando una descarga termine correctamente,<br />aparecerá aquí incluso después de reiniciar.</span></div> : <div className="queue-list">{history.map((entry, index) => <HistoryEntryCard key={entry.id} entry={entry} position={index + 1} onOpenFile={() => void openFile(entry.id)} onOpenFolder={() => void openFolder(entry.id)} onRemove={() => void removeHistoryEntry(entry.id)} />)}</div>}</section> : <section className="panel secondary-view"><h1>ACERCA DE</h1><p>YT Download usa yt-dlp, FFmpeg, ffprobe y Deno empaquetados localmente para analizar y procesar tus descargas.</p><FolderOpen size={28} /></section>}
         </section>
       </div>
       {isUpdatePromptOpen && updaterState === "available" && <UpdatePrompt version={updateVersion} message={updateMessage} onInstall={() => void installUpdate()} onDismiss={() => setUpdatePromptOpen(false)} />}

@@ -31,7 +31,12 @@ export interface QualityOption {
   videoFormats: VideoFormat[];
 }
 
-export type BrowserSession = "chrome" | "edge";
+export type BrowserSession = "firefox" | "edge" | "chrome" | "brave";
+
+export type YoutubeAccessStrategy =
+  | { kind: "public" }
+  | { kind: "pot" }
+  | { kind: "browser"; browser: BrowserSession; usePotProvider: boolean };
 
 export interface AnalyzedVideo {
   id: string;
@@ -40,7 +45,9 @@ export interface AnalyzedVideo {
   channel?: string;
   duration?: number;
   thumbnail?: string;
-  /** Browser session explicitly chosen when this source was analyzed. */
+  /** Exact successful strategy to reuse for the download. */
+  accessStrategy: YoutubeAccessStrategy;
+  /** Browser session selected automatically when this source required one. */
   browserSession?: BrowserSession | null;
   /** True only when the source needed the bundled local YouTube verifier. */
   usePotProvider: boolean;
@@ -51,7 +58,7 @@ export interface AnalyzedVideo {
 export interface AnalysisFailure {
   url: string;
   message: string;
-  /** True only when YouTube requests anti-bot verification. */
+  /** True only when the content itself requires a signed-in account. */
   requiresBrowserSession: boolean;
 }
 
@@ -96,6 +103,7 @@ export interface AddDownloadJobRequest {
   selectedFormatId: string | null;
   selectedFormatHasAudio: boolean | null;
   compatibilityMode: boolean;
+  accessStrategy: YoutubeAccessStrategy;
   browserSession?: BrowserSession | null;
   usePotProvider: boolean;
   container: DownloadContainer;
