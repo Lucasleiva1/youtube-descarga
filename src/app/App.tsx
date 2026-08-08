@@ -117,7 +117,7 @@ function UpdatePanel({ state, version, message, onCheck, onInstall }: UpdatePane
     <section className="update-panel">
       <div>
         <p className="eyebrow">ACTUALIZACIONES</p>
-        <span>Las versiones se verifican desde GitHub Releases y se instalan de forma segura.</span>
+        <span>Al abrir la app se buscan e instalan automáticamente las versiones firmadas de GitHub Releases.</span>
       </div>
       <div className="update-actions">
         <button className="secondary-button" disabled={checking || downloading} onClick={onCheck}><Search size={16} />{checking ? "BUSCANDO…" : "BUSCAR ACTUALIZACIÓN"}</button>
@@ -344,7 +344,7 @@ export function App() {
   }, [applyDownloadEvent, setHistory, setQueueSnapshot]);
 
   useEffect(() => {
-    void checkForUpdates(true);
+    void checkForUpdates(true, true);
     return () => {
       const update = pendingUpdateRef.current;
       pendingUpdateRef.current = null;
@@ -419,7 +419,7 @@ export function App() {
     }
   }
 
-  async function checkForUpdates(silent = false) {
+  async function checkForUpdates(silent = false, installWhenAvailable = false) {
     setUpdaterState("checking");
     setUpdateMessage(undefined);
     try {
@@ -438,6 +438,7 @@ export function App() {
       setUpdateVersion(update.version);
       setUpdaterState("available");
       setUpdateMessage(update.body?.trim() || `Hay una nueva versión disponible: ${update.version}.`);
+      if (installWhenAvailable) await installUpdate();
     } catch (reason) {
       setUpdateVersion(undefined);
       setUpdaterState("error");
