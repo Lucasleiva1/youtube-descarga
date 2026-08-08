@@ -159,8 +159,8 @@ body { min-width: 0; overflow-x: hidden; }
 .update-message.available { color: #75dc86; }
 .update-message.error { color: #ef8a8a; }
 
-.brand-logo { flex: 0 0 auto; display: grid; width: 42px; height: 42px; overflow: hidden; border-radius: 11px; background: #111318; box-shadow: 0 0 15px rgba(241, 31, 31, .3); }
-.brand-logo img { width: 100%; max-width: 100%; height: 100%; object-fit: contain; border-radius: inherit; }
+.brand-logo { flex: 0 0 auto; display: grid; width: 42px; height: 42px; overflow: visible; background: transparent; }
+.brand-logo img { width: 100%; max-width: 100%; height: 100%; object-fit: contain; }
 
 /* Never expose the browser/Windows default scrollbars inside the app. */
 * { scrollbar-width: thin; scrollbar-color: #5b5b5b #181818; }

@@ -4,10 +4,24 @@ mod history;
 
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, ffi::OsStr, path::PathBuf};
 use std::process::Command;
 use tauri::Manager;
 use url::Url;
+
+/// Starts sidecar executables without allowing Windows to create a visible
+/// console window for them. yt-dlp, FFmpeg and Deno are console programs, but
+/// their output is captured and shown in the application's own interface.
+pub(crate) fn hidden_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,7 +91,7 @@ fn probe_command(name: &str, path: Option<PathBuf>, args: &[&str]) -> EngineInfo
         };
     };
     let display_path = program.display().to_string();
-    match Command::new(&program).args(args).output() {
+    match hidden_command(&program).args(args).output() {
         Ok(output) if output.status.success() && !output.stdout.is_empty() => EngineInfo {
             name: name.to_owned(),
             state: "available".to_owned(),
@@ -214,7 +228,7 @@ fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>) -> Result<AnalysisResu
             failures.push(AnalysisFailure { url: clean_url, message: "URL inválida o no compatible. Usá un enlace de YouTube.".to_owned() });
             continue;
         }
-        let output = Command::new(&binary)
+        let output = hidden_command(&binary)
             .args(["--ignore-config", "--no-plugin-dirs", "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", "--ffmpeg-location"])
             .arg(&ffmpeg_directory)
             .arg("--js-runtimes")

@@ -1,4 +1,4 @@
-use crate::{engine, history};
+use crate::{engine, hidden_command, history};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -6,7 +6,7 @@ use std::{
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -238,7 +238,7 @@ fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
     let binary = paths.yt_dlp.as_ref().ok_or_else(|| "yt-dlp no está disponible.".to_owned())?;
     let ffmpeg_directory = engine::yt_dlp_ffmpeg_location(app, &paths)?;
     let deno = paths.deno.ok_or_else(|| "Deno no está disponible.".to_owned())?;
-    let mut command = Command::new(binary);
+    let mut command = hidden_command(binary);
     command.args(["--ignore-config", "--no-plugin-dirs", "--no-playlist", "--newline", "--progress", "--windows-filenames", "--trim-filenames", "180", "--no-overwrites", "--paths"])
         .arg(&destination).arg("--output").arg("%(title)s [%(height)sp].%(ext)s")
         .arg("--ffmpeg-location").arg(ffmpeg_directory).arg("--js-runtimes").arg(format!("deno:{}", deno.display()))
@@ -280,7 +280,7 @@ fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
 
 fn verify_file(app: &AppHandle, file: &Path) -> Result<DownloadVerification, String> {
     let ffprobe = engine::EnginePaths::resolve(app).ffprobe.ok_or_else(|| "ffprobe no está disponible.".to_owned())?;
-    let output = Command::new(ffprobe).args(["-v", "error", "-show_streams", "-show_format", "-of", "json"]).arg(file).output().map_err(|error| format!("No se pudo iniciar ffprobe: {error}"))?;
+    let output = hidden_command(ffprobe).args(["-v", "error", "-show_streams", "-show_format", "-of", "json"]).arg(file).output().map_err(|error| format!("No se pudo iniciar ffprobe: {error}"))?;
     if !output.status.success() { return Err("ffprobe no pudo validar el archivo final.".to_owned()); }
     let data: Value = serde_json::from_slice(&output.stdout).map_err(|_| "ffprobe devolvió datos inválidos.".to_owned())?;
     let streams = data.get("streams").and_then(Value::as_array).ok_or_else(|| "ffprobe no encontró streams.".to_owned())?;
@@ -290,7 +290,7 @@ fn verify_file(app: &AppHandle, file: &Path) -> Result<DownloadVerification, Str
 }
 
 fn terminate_process(process_id: u32) {
-    let _ = Command::new("taskkill.exe").args(["/PID", &process_id.to_string(), "/T", "/F"]).output();
+    let _ = hidden_command("taskkill.exe").args(["/PID", &process_id.to_string(), "/T", "/F"]).output();
 }
 pub fn cancel(app: AppHandle, job_id: String) -> Result<(), String> {
     let process = app.state::<DownloadManager>().processes.lock().map_err(|_| "No se pudo acceder al proceso.".to_owned())?.get(&job_id).cloned();

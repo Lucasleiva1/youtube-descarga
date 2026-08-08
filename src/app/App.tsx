@@ -692,7 +692,7 @@ export function App() {
   return (
     <main className="app-shell">
       <header className="app-header" data-tauri-drag-region>
-        <div className="brand" data-tauri-drag-region><span className="brand-logo" title="YT Downloader"><img src={logoImage} alt="Logo YT Downloader" /></span><strong><em>YT</em> DOWNLOAD</strong><small>v0.1.1-rc.3</small></div>
+        <div className="brand" data-tauri-drag-region><span className="brand-logo" title="YT Downloader"><img src={logoImage} alt="Logo YT Downloader" /></span><strong><em>YT</em> DOWNLOAD</strong><small>v0.1.1-rc.4</small></div>
         <div className="engines" data-tauri-drag-region>{engines.filter((engine) => engine.name === "yt-dlp" || engine.name === "ffmpeg").map((engine) => <EngineBadge engine={engine} key={engine.name} />)}</div>
       </header>
 
