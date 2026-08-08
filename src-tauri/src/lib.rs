@@ -38,6 +38,7 @@ struct EngineInfo {
 struct VideoFormat {
     id: String,
     extension: String,
+    format_note: Option<String>,
     height: Option<u32>,
     width: Option<u32>,
     fps: Option<f64>,
@@ -55,6 +56,8 @@ struct VideoFormat {
 struct QualityOption {
     height: u32,
     label: String,
+    format_id: String,
+    format_has_audio: bool,
     video_formats: Vec<VideoFormat>,
 }
 
@@ -67,6 +70,7 @@ struct AnalyzedVideo {
     channel: Option<String>,
     duration: Option<f64>,
     thumbnail: Option<String>,
+    browser_session: Option<String>,
     qualities: Vec<QualityOption>,
     formats: Vec<VideoFormat>,
 }
@@ -134,6 +138,27 @@ fn is_supported_youtube_url(value: &str) -> bool {
     host == "youtu.be" || host == "www.youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
 }
 
+fn browser_session_name(value: Option<&str>) -> Result<Option<&'static str>, String> {
+    match value {
+        None => Ok(None),
+        Some("chrome") => Ok(Some("chrome")),
+        Some("edge") => Ok(Some("edge")),
+        _ => Err("El navegador seleccionado no es compatible.".to_owned()),
+    }
+}
+
+/// The public Android VR client exposes direct source formats without needing
+/// any account. If the user explicitly opts in to a local browser session, use
+/// a cookie-compatible client and the session stays local to that browser.
+fn configure_youtube_access(command: &mut Command, browser_session: Option<&str>) {
+    if let Some(browser) = browser_session {
+        command.arg("--cookies-from-browser").arg(browser)
+            .arg("--extractor-args").arg("youtube:player_client=web_safari");
+    } else {
+        command.arg("--extractor-args").arg("youtube:player_client=android_vr");
+    }
+}
+
 fn string_field(object: &Value, name: &str) -> Option<String> {
     object.get(name).and_then(Value::as_str).map(ToOwned::to_owned)
 }
@@ -157,6 +182,7 @@ fn to_video_format(value: &Value) -> Option<VideoFormat> {
     Some(VideoFormat {
         id,
         extension: string_field(value, "ext").unwrap_or_else(|| "unknown".to_owned()),
+        format_note: string_field(value, "format_note"),
         height: number_field(value, "height").map(|height| height as u32),
         width: number_field(value, "width").map(|width| width as u32),
         fps: number_field(value, "fps"),
@@ -170,6 +196,28 @@ fn to_video_format(value: &Value) -> Option<VideoFormat> {
     })
 }
 
+/// Only direct, usable video streams belong in the resolution picker. This
+/// rejects thumbnails/storyboards, DRM entries and incomplete records.
+fn is_downloadable_video_format(value: &Value, format: &VideoFormat) -> bool {
+    let has_direct_url = value.get("url").and_then(Value::as_str).is_some_and(|url| !url.trim().is_empty());
+    let is_drm_protected = value.get("has_drm").and_then(Value::as_bool).unwrap_or(false);
+    let is_storyboard = value.get("format_note").and_then(Value::as_str).is_some_and(|note| note.to_ascii_lowercase().contains("storyboard"));
+    format.has_video
+        && format.width.is_some_and(|width| width > 0)
+        && format.height.is_some_and(|height| height > 0)
+        && has_direct_url
+        && !is_drm_protected
+        && !is_storyboard
+}
+
+fn preferred_format(left: &VideoFormat, right: &VideoFormat) -> std::cmp::Ordering {
+    left.fps.partial_cmp(&right.fps).unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left.bitrate.partial_cmp(&right.bitrate).unwrap_or(std::cmp::Ordering::Equal))
+        .then_with(|| left.filesize.or(left.filesize_approx).cmp(&right.filesize.or(right.filesize_approx)))
+        .then_with(|| left.has_audio.cmp(&right.has_audio))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
 fn quality_label(height: u32) -> String {
     match height {
         4320 => format!("{height}p · 8K"),
@@ -181,17 +229,56 @@ fn quality_label(height: u32) -> String {
     }
 }
 
+/// YouTube sometimes assigns a standard quality name to a non-standard frame
+/// size (for example, a 2:1 movie can be 1280x640 but be advertised as 720p).
+/// Prefer that source-provided name instead of fabricating a label from height.
+fn source_quality_label(format: &VideoFormat, height: u32) -> String {
+    let source_note = format.format_note.as_deref().map(str::trim).filter(|note| {
+        note.strip_suffix('p').is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+    });
+    match source_note {
+        Some(note) if note != format!("{height}p") => format!("{note} ({})", format.resolution_label()),
+        Some(note) => match height {
+            4320 => format!("{note} · 8K"),
+            2160 => format!("{note} · 4K"),
+            1440 => format!("{note} · 2K"),
+            1080 => format!("{note} · Full HD"),
+            720 => format!("{note} · HD"),
+            _ => note.to_owned(),
+        },
+        None => quality_label(height),
+    }
+}
+
+impl VideoFormat {
+    fn resolution_label(&self) -> String {
+        match (self.width, self.height) {
+            (Some(width), Some(height)) => format!("{width} × {height} px"),
+            _ => "tamaño informado por la fuente".to_owned(),
+        }
+    }
+}
+
 fn parse_video(url: String, stdout: &[u8]) -> Result<AnalyzedVideo, String> {
     let data: Value = serde_json::from_slice(stdout).map_err(|_| "yt-dlp devolvió metadata inválida.".to_owned())?;
     let mut formats: Vec<VideoFormat> = data.get("formats").and_then(Value::as_array).into_iter().flatten().filter_map(to_video_format).collect();
     formats.sort_by_key(|format| (format.height.unwrap_or(0), format.fps.unwrap_or(0.0) as u32));
-    let mut heights: Vec<u32> = formats.iter().filter(|format| format.has_video).filter_map(|format| format.height).collect();
+    let downloadable_formats: Vec<VideoFormat> = data.get("formats").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|value| to_video_format(value).filter(|format| is_downloadable_video_format(value, format)))
+        .collect();
+    let mut heights: Vec<u32> = downloadable_formats.iter().filter_map(|format| format.height).collect();
     heights.sort_unstable();
     heights.dedup();
-    let mut qualities: Vec<QualityOption> = heights.into_iter().map(|height| QualityOption {
-        height,
-        label: quality_label(height),
-        video_formats: formats.iter().filter(|format| format.has_video && format.height == Some(height)).cloned().collect(),
+    let mut qualities: Vec<QualityOption> = heights.into_iter().filter_map(|height| {
+        let video_formats: Vec<VideoFormat> = downloadable_formats.iter().filter(|format| format.height == Some(height)).cloned().collect();
+        let selected = video_formats.iter().max_by(|left, right| preferred_format(left, right))?;
+        Some(QualityOption {
+            height,
+            label: source_quality_label(selected, height),
+            format_id: selected.id.clone(),
+            format_has_audio: selected.has_audio,
+            video_formats,
+        })
     }).collect();
     qualities.sort_by(|left, right| right.height.cmp(&left.height));
     Ok(AnalyzedVideo {
@@ -201,18 +288,20 @@ fn parse_video(url: String, stdout: &[u8]) -> Result<AnalyzedVideo, String> {
         channel: string_field(&data, "channel").or_else(|| string_field(&data, "uploader")),
         duration: number_field(&data, "duration"),
         thumbnail: safe_http_url(string_field(&data, "thumbnail")),
+        browser_session: None,
         qualities,
         formats,
     })
 }
 
 #[tauri::command]
-fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>) -> Result<AnalysisResult, String> {
+fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>, browser_session: Option<String>) -> Result<AnalysisResult, String> {
     let paths = engine::EnginePaths::resolve(&app);
     paths.required_for_youtube()?;
     let binary = paths.yt_dlp.as_ref().ok_or_else(|| "yt-dlp no está disponible.".to_owned())?;
     let ffmpeg_directory = engine::yt_dlp_ffmpeg_location(&app, &paths)?;
     let deno = paths.deno.ok_or_else(|| "No se pudo resolver Deno.".to_owned())?;
+    let browser_session = browser_session_name(browser_session.as_deref())?.map(ToOwned::to_owned);
     let mut videos = Vec::new();
     let mut failures = Vec::new();
     let mut seen_urls = HashSet::new();
@@ -228,22 +317,26 @@ fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>) -> Result<AnalysisResu
             failures.push(AnalysisFailure { url: clean_url, message: "URL inválida o no compatible. Usá un enlace de YouTube.".to_owned() });
             continue;
         }
-        let output = hidden_command(&binary)
-            .args(["--ignore-config", "--no-plugin-dirs", "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", "--ffmpeg-location"])
+        let mut command = hidden_command(&binary);
+        command.args(["--ignore-config", "--no-plugin-dirs", "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", "--ffmpeg-location"])
             .arg(&ffmpeg_directory)
             .arg("--js-runtimes")
-            .arg(format!("deno:{}", deno.display()))
-            .arg(&clean_url)
+            .arg(format!("deno:{}", deno.display()));
+        configure_youtube_access(&mut command, browser_session.as_deref());
+        let output = command.arg(&clean_url)
             .output()
             .map_err(|_| "yt-dlp no está disponible. Instalalo o agregalo a los binarios de la aplicación.".to_owned())?;
         if !output.status.success() {
             let technical = String::from_utf8_lossy(&output.stderr);
-            let message = if technical.contains("Private video") { "El video es privado." } else if technical.contains("Video unavailable") { "El video no está disponible." } else { "No se pudo obtener la información del video." };
+            let message = if technical.contains("Private video") { "El video es privado." } else if technical.contains("Video unavailable") { "El video no está disponible." } else if technical.contains("Sign in to confirm") && browser_session.is_none() { "YouTube pidió una verificación anti-bot. En Configuración elegí usar tu sesión local de Chrome o Edge y volvé a analizar; la app no guarda credenciales." } else if technical.contains("Sign in to confirm") { "YouTube sigue rechazando esta sesión local. Confirmá que tenés YouTube abierto en el navegador seleccionado y reintentá." } else { "No se pudo obtener la información del video." };
             failures.push(AnalysisFailure { url: clean_url, message: message.to_owned() });
             continue;
         }
         match parse_video(clean_url.clone(), &output.stdout) {
-            Ok(video) if seen_video_ids.insert(video.id.clone()) => videos.push(video),
+            Ok(mut video) if seen_video_ids.insert(video.id.clone()) => {
+                video.browser_session = browser_session.clone();
+                videos.push(video);
+            },
             Ok(_) => failures.push(AnalysisFailure { url: clean_url, message: "El video ya fue analizado mediante otra URL.".to_owned() }),
             Err(message) => failures.push(AnalysisFailure { url: clean_url, message }),
         }
@@ -284,6 +377,41 @@ fn open_download_folder(app: tauri::AppHandle, job_id: String) -> Result<(), Str
 fn get_history(app: tauri::AppHandle) -> Result<Vec<history::HistoryEntry>, String> { history::list(&app) }
 #[tauri::command]
 fn remove_history_entry(app: tauri::AppHandle, id: String) -> Result<(), String> { history::remove(&app, &id) }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_video;
+    use serde_json::json;
+
+    #[test]
+    fn exposes_only_direct_downloadable_resolutions() {
+        let metadata = json!({
+            "id": "example",
+            "title": "Example",
+            "formats": [
+                { "format_id": "401", "ext": "webm", "width": 3840, "height": 2160, "fps": 30, "vcodec": "av01", "acodec": "none", "tbr": 12000, "format_note": "2160p", "url": "https://example.test/2160" },
+                { "format_id": "399", "ext": "mp4", "width": 1920, "height": 1080, "fps": 60, "vcodec": "avc1", "acodec": "none", "tbr": 7000, "url": "https://example.test/1080" },
+                { "format_id": "sb0", "ext": "mhtml", "width": 1920, "height": 1080, "vcodec": "avc1", "acodec": "none", "format_note": "storyboard", "url": "https://example.test/storyboard" },
+                { "format_id": "drm", "ext": "mp4", "width": 1280, "height": 720, "vcodec": "avc1", "acodec": "none", "has_drm": true, "url": "https://example.test/drm" },
+                { "format_id": "missing", "ext": "mp4", "width": 854, "height": 480, "vcodec": "avc1", "acodec": "none" }
+            ]
+        });
+        let video = parse_video("https://www.youtube.com/watch?v=example".to_owned(), metadata.to_string().as_bytes()).expect("metadata should parse");
+        let heights: Vec<u32> = video.qualities.iter().map(|quality| quality.height).collect();
+        assert_eq!(heights, vec![2160, 1080]);
+        assert_eq!(video.qualities[0].format_id, "401");
+    }
+
+    #[test]
+    fn keeps_the_source_quality_name_for_nonstandard_frame_sizes() {
+        let metadata = json!({
+            "id": "cinema", "title": "Cinema",
+            "formats": [{ "format_id": "398", "ext": "mp4", "width": 1280, "height": 640, "vcodec": "avc1", "acodec": "none", "format_note": "720p", "url": "https://example.test/720" }]
+        });
+        let video = parse_video("https://www.youtube.com/watch?v=cinema".to_owned(), metadata.to_string().as_bytes()).expect("metadata should parse");
+        assert_eq!(video.qualities[0].label, "720p (1280 × 640 px)");
+    }
+}
 
 pub fn run() {
     let app = tauri::Builder::default()

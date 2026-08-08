@@ -36,7 +36,7 @@ pub struct DownloadVerification { pub width: Option<u32>, pub height: Option<u32
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRequest {
     pub video_id: String, pub url: String, pub title: String, pub thumbnail: Option<String>, pub channel: Option<String>,
-    pub quality_height: Option<u32>, pub container: String, pub destination: String,
+    pub quality_height: Option<u32>, pub selected_format_id: Option<String>, pub selected_format_has_audio: Option<bool>, #[serde(default)] pub compatibility_mode: bool, #[serde(default)] pub browser_session: Option<String>, pub container: String, pub destination: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +66,8 @@ fn now_epoch() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_d
 fn job_id() -> String { format!("job-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()) }
 
 fn valid_container(value: &str) -> bool { matches!(value, "auto" | "mp4" | "mkv" | "webm") }
+fn valid_format_id(value: &str) -> bool { !value.is_empty() && value.len() <= 96 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')) }
+fn valid_browser_session(value: Option<&str>) -> bool { matches!(value, None | Some("chrome") | Some("edge")) }
 fn valid_youtube_url(value: &str) -> bool {
     let Ok(url) = Url::parse(value.trim()) else { return false; };
     if !matches!(url.scheme(), "https" | "http") { return false; }
@@ -99,6 +101,8 @@ fn emit_job(app: &AppHandle, event: &str, job_id: &str, include_job: bool, progr
 pub fn add(app: AppHandle, request: DownloadRequest) -> Result<DownloadJob, String> {
     paths_ready(&app)?;
     if !valid_container(&request.container) { return Err("Contenedor no válido.".to_owned()); }
+    if request.selected_format_id.as_deref().is_some_and(|format_id| !valid_format_id(format_id)) { return Err("El formato seleccionado no es válido.".to_owned()); }
+    if !valid_browser_session(request.browser_session.as_deref()) { return Err("El navegador seleccionado no es compatible.".to_owned()); }
     if request.video_id.trim().is_empty() || request.url.trim().is_empty() || request.destination.trim().is_empty() { return Err("Faltan datos para agregar la descarga a la cola.".to_owned()); }
     if !valid_youtube_url(&request.url) { return Err("La URL no es un enlace de YouTube válido.".to_owned()); }
     if app.state::<DownloadManager>().state.lock().map_err(|_| "No se pudo bloquear la cola.".to_owned())?
@@ -228,8 +232,15 @@ fn output_directory(job: &DownloadJob) -> Result<PathBuf, String> {
     fs::create_dir_all(&directory).map_err(|error| format!("No se pudo crear la carpeta de destino: {error}"))?;
     directory.canonicalize().map_err(|error| format!("No se pudo acceder a la carpeta de destino: {error}"))
 }
+fn requested_format_selector(selected_format_id: Option<&str>, selected_format_has_audio: Option<bool>, quality_height: Option<u32>, compatibility_mode: bool) -> String {
+    if let Some(format_id) = selected_format_id {
+        return if selected_format_has_audio == Some(true) { format_id.to_owned() } else { format!("{format_id}+ba") };
+    }
+    if compatibility_mode { return "bv*+ba/b".to_owned(); }
+    match quality_height { Some(height) => format!("bv*[height={height}]+ba"), None => "bv*+ba/b".to_owned() }
+}
 fn format_selector(job: &DownloadJob) -> String {
-    match job.request.quality_height { Some(height) => format!("bv*[height={height}]+ba/b[height={height}]"), None => "bv*+ba/b".to_owned() }
+    requested_format_selector(job.request.selected_format_id.as_deref(), job.request.selected_format_has_audio, job.request.quality_height, job.request.compatibility_mode)
 }
 
 fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
@@ -241,7 +252,14 @@ fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
     let mut command = hidden_command(binary);
     command.args(["--ignore-config", "--no-plugin-dirs", "--no-playlist", "--newline", "--progress", "--windows-filenames", "--trim-filenames", "180", "--no-overwrites", "--paths"])
         .arg(&destination).arg("--output").arg("%(title)s [%(height)sp].%(ext)s")
-        .arg("--ffmpeg-location").arg(ffmpeg_directory).arg("--js-runtimes").arg(format!("deno:{}", deno.display()))
+        .arg("--ffmpeg-location").arg(ffmpeg_directory).arg("--js-runtimes").arg(format!("deno:{}", deno.display()));
+    if let Some(browser) = job.request.browser_session.as_deref() {
+        command.arg("--cookies-from-browser").arg(browser)
+            .arg("--extractor-args").arg("youtube:player_client=web_safari");
+    } else {
+        command.arg("--extractor-args").arg("youtube:player_client=android_vr");
+    }
+    command
         .arg("--format").arg(format_selector(job))
         .arg("--progress-template").arg(format!("download:{PROGRESS_PREFIX}%(progress.status)s\t%(progress._percent_str)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.total_bytes_estimate)s\t%(progress.speed)s\t%(progress.eta)s"))
         .arg("--progress-template").arg(format!("postprocess:{PROCESSING_PREFIX}%(progress.status)s"))
@@ -360,7 +378,7 @@ pub fn open_folder(app: AppHandle, job_id: String) -> Result<(), String> { let p
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_progress, valid_youtube_url, PROGRESS_PREFIX};
+    use super::{parse_progress, requested_format_selector, valid_youtube_url, PROGRESS_PREFIX};
 
     #[test]
     fn parses_only_structured_progress_fields() {
@@ -380,6 +398,26 @@ mod tests {
         assert!(valid_youtube_url("https://youtu.be/abc"));
         assert!(!valid_youtube_url("https://youtube.com.evil.example/watch?v=abc"));
         assert!(!valid_youtube_url("file:///C:/video.mp4"));
+    }
+
+    #[test]
+    fn selected_format_never_falls_back_to_a_lower_resolution() {
+        assert_eq!(requested_format_selector(Some("401"), Some(false), Some(2160), false), "401+ba");
+        assert_eq!(requested_format_selector(Some("22"), Some(true), Some(720), false), "22");
+    }
+
+    #[test]
+    fn compatibility_mode_is_explicit_and_never_used_for_a_source_selection() {
+        assert_eq!(requested_format_selector(None, None, None, true), "bv*+ba/b");
+        assert_eq!(requested_format_selector(Some("401"), Some(false), Some(2160), true), "401+ba");
+    }
+
+    #[test]
+    fn accepts_only_supported_local_browser_sessions() {
+        assert!(super::valid_browser_session(None));
+        assert!(super::valid_browser_session(Some("chrome")));
+        assert!(super::valid_browser_session(Some("edge")));
+        assert!(!super::valid_browser_session(Some("firefox")));
     }
 
 }

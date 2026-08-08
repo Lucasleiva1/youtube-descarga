@@ -26,8 +26,12 @@ export interface VideoFormat {
 export interface QualityOption {
   height: number;
   label: string;
+  formatId: string;
+  formatHasAudio: boolean;
   videoFormats: VideoFormat[];
 }
+
+export type BrowserSession = "chrome" | "edge";
 
 export interface AnalyzedVideo {
   id: string;
@@ -36,6 +40,8 @@ export interface AnalyzedVideo {
   channel?: string;
   duration?: number;
   thumbnail?: string;
+  /** Browser session explicitly chosen when this source was analyzed. */
+  browserSession?: BrowserSession | null;
   qualities: QualityOption[];
   formats: VideoFormat[];
 }
@@ -67,6 +73,11 @@ export type DownloadStatus =
 export interface DownloadSelection {
   /** null means "MEJOR CALIDAD" and is resolved by yt-dlp using real formats. */
   qualityHeight: number | null;
+  /** Exact yt-dlp stream selected during analysis; never a guessed resolution. */
+  selectedFormatId: string | null;
+  selectedFormatHasAudio: boolean | null;
+  /** Explicit opt-in only: yt-dlp chooses its best compatible source stream. */
+  compatibilityMode: boolean;
   container: DownloadContainer;
 }
 
@@ -78,6 +89,10 @@ export interface AddDownloadJobRequest {
   thumbnail?: string | null;
   channel?: string | null;
   qualityHeight: number | null;
+  selectedFormatId: string | null;
+  selectedFormatHasAudio: boolean | null;
+  compatibilityMode: boolean;
+  browserSession?: BrowserSession | null;
   container: DownloadContainer;
   destination: string;
 }

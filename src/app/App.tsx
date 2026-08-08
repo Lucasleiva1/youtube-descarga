@@ -32,6 +32,7 @@ import type {
   AnalysisFailure,
   AnalysisResult,
   AnalyzedVideo,
+  BrowserSession,
   DownloadContainer,
   DownloadEvent,
   DownloadJob,
@@ -43,9 +44,16 @@ import type {
 } from "../types/download";
 
 const defaultDestination = "Elegí una carpeta de destino";
+type YoutubeAccessMode = "public" | BrowserSession;
 function defaultSelectionFor(video: AnalyzedVideo): DownloadSelection {
-  const highestQuality = video.qualities.reduce<number | null>((highest, quality) => highest === null || quality.height > highest ? quality.height : highest, null);
-  return { qualityHeight: highestQuality, container: "mp4" };
+  const highestQuality = video.qualities[0];
+  return {
+    qualityHeight: highestQuality?.height ?? null,
+    selectedFormatId: highestQuality?.formatId ?? null,
+    selectedFormatHasAudio: highestQuality?.formatHasAudio ?? null,
+    compatibilityMode: false,
+    container: "mp4",
+  };
 }
 
 function errorMessage(reason: unknown, fallback: string): string {
@@ -145,8 +153,8 @@ interface VideoCardProps {
 
 function VideoCard({ video, selection, alreadyQueued, onSelectionChange, onAdd, onRemove }: VideoCardProps) {
   const qualities = useMemo(() => [...video.qualities].sort((left, right) => right.height - left.height), [video.qualities]);
-  const selectedHeight = selection.qualityHeight ?? qualities[0]?.height ?? null;
-  const selected = qualities.find((option) => option.height === selectedHeight);
+  const selected = qualities.find((option) => option.formatId === selection.selectedFormatId);
+  const resolutionValue = selection.compatibilityMode ? "__compatibility__" : selected?.formatId ?? "";
 
   return (
     <article className="video-card">
@@ -164,15 +172,24 @@ function VideoCard({ video, selection, alreadyQueued, onSelectionChange, onAdd, 
         <div className="select-wrap">
           <select
             aria-label={`Resolución para ${video.title}`}
-            value={selectedHeight === null ? "" : String(selectedHeight)}
-            onChange={(event) => onSelectionChange({ qualityHeight: Number(event.target.value) })}
+            value={resolutionValue}
+            onChange={(event) => {
+              if (event.target.value === "__compatibility__") {
+                onSelectionChange({ qualityHeight: null, selectedFormatId: null, selectedFormatHasAudio: null, compatibilityMode: true });
+                return;
+              }
+              const quality = qualities.find((option) => option.formatId === event.target.value);
+              if (quality) onSelectionChange({ qualityHeight: quality.height, selectedFormatId: quality.formatId, selectedFormatHasAudio: quality.formatHasAudio, compatibilityMode: false });
+            }}
           >
-            {qualities.length === 0 && <option value="">SIN CALIDAD DISPONIBLE</option>}
-            {qualities.map((option) => <option key={option.height} value={option.height}>{option.label}</option>)}
+            {qualities.length === 0 && <option value="">SIN CALIDAD ORIGINAL DISPONIBLE</option>}
+            {qualities.map((option) => <option key={option.formatId} value={option.formatId}>{option.label}</option>)}
+            <option disabled>──────── Compatibilidad ────────</option>
+            <option value="__compatibility__">MEJOR CALIDAD COMPATIBLE (PUEDE SER INFERIOR)</option>
           </select>
           <ChevronDown size={15} />
         </div>
-        <small>{selected ? `${selected.videoFormats.length} stream${selected.videoFormats.length === 1 ? "" : "s"} detectados` : "Calidad no disponible"}</small>
+        <small>{selection.compatibilityMode ? "No es una calidad verificada: yt-dlp elegirá la mejor fuente que pueda descargar, aunque sea inferior." : selected ? `${selected.videoFormats.length} stream${selected.videoFormats.length === 1 ? "" : "s"} originales detectados` : "No hay una calidad original verificable"}</small>
       </label>
       <label className="select-field compact">
         <span>Formato</span>
@@ -303,6 +320,7 @@ export function App() {
   const [updaterState, setUpdaterState] = useState<UpdaterState>("idle");
   const [updateVersion, setUpdateVersion] = useState<string>();
   const [updateMessage, setUpdateMessage] = useState<string>();
+  const [youtubeAccessMode, setYoutubeAccessMode] = useState<YoutubeAccessMode>("public");
 
   useEffect(() => {
     void invoke<EngineInfo[]>("check_engines")
@@ -395,7 +413,10 @@ export function App() {
     }
     setAnalyzing(true);
     try {
-      const result = await invoke<AnalysisResult>("analyze_urls", { urls: uniqueUrls });
+      const result = await invoke<AnalysisResult>("analyze_urls", {
+        urls: uniqueUrls,
+        browserSession: youtubeAccessMode === "public" ? null : youtubeAccessMode,
+      });
       setVideos(result.videos);
       setAnalysisFailures(result.failures);
       if (result.videos.length > 0) setNotice(`${result.videos.length} video${result.videos.length === 1 ? "" : "s"} analizado${result.videos.length === 1 ? "" : "s"}. Elegí la calidad y agregalo a la cola.`);
@@ -533,6 +554,10 @@ export function App() {
       thumbnail: video.thumbnail,
       channel: video.channel,
       qualityHeight: selection.qualityHeight,
+      selectedFormatId: selection.selectedFormatId,
+      selectedFormatHasAudio: selection.selectedFormatHasAudio,
+      compatibilityMode: selection.compatibilityMode,
+      browserSession: video.browserSession ?? null,
       container: selection.container,
       destination,
     };
@@ -692,7 +717,7 @@ export function App() {
   return (
     <main className="app-shell">
       <header className="app-header" data-tauri-drag-region>
-        <div className="brand" data-tauri-drag-region><span className="brand-logo" title="YT Downloader"><img src={logoImage} alt="Logo YT Downloader" /></span><strong><em>YT</em> DOWNLOAD</strong><small>v0.1.1-rc.4</small></div>
+        <div className="brand" data-tauri-drag-region><span className="brand-logo" title="YT Downloader"><img src={logoImage} alt="Logo YT Downloader" /></span><strong><em>YT</em> DOWNLOAD</strong><small>v0.1.1-rc.5</small></div>
         <div className="engines" data-tauri-drag-region>{engines.filter((engine) => engine.name === "yt-dlp" || engine.name === "ffmpeg").map((engine) => <EngineBadge engine={engine} key={engine.name} />)}</div>
       </header>
 
@@ -756,7 +781,7 @@ export function App() {
               <article className="panel progress-panel"><p className="eyebrow">PROGRESO GENERAL</p><div className="progress-idle"><span>{queueProgress}%</span><div><i style={{ width: `${queueProgress}%` }} /></div><small>{jobs.length === 0 ? "No hay descargas activas" : `${completedJobs.length} de ${jobs.length} trabajo${jobs.length === 1 ? "" : "s"} completado${completedJobs.length === 1 ? "" : "s"}`}</small></div></article>
               </div>
             </section>
-          </> : activeView === "settings" ? <section className="panel diagnostics-panel"><header><div><h1>CONFIGURACIÓN</h1><p>DIAGNÓSTICO DEL MOTOR</p></div><button className="secondary-button" onClick={() => void refreshEngines()}><LoaderCircle size={16} />VOLVER A COMPROBAR</button></header><div className="diagnostic-list">{engines.map((engine) => <article key={engine.name}><span className={engine.state === "available" ? "engine-dot is-active" : engine.state === "checking" ? "engine-dot is-checking" : "engine-dot is-unavailable"} /><div><strong>{engine.name}</strong><p>Estado: {engine.state === "available" ? "Activo" : engine.state === "checking" ? "Comprobando" : "No disponible"}</p><p>Versión: {engine.version ?? "—"}</p><p className="diagnostic-path">Ruta: {engine.path ?? engine.detail ?? "—"}</p></div></article>)}</div></section> : activeView === "history" ? <section className="panel history-panel"><header className="section-header"><div><p className="eyebrow">HISTORIAL RECIENTE</p><span>Descargas persistidas localmente.</span></div></header>{history.length === 0 ? <div className="queue-empty"><History size={27} /><strong>SIN DESCARGAS COMPLETADAS</strong><span>Cuando una descarga termine correctamente,<br />aparecerá aquí incluso después de reiniciar.</span></div> : <div className="queue-list">{history.map((entry, index) => <HistoryEntryCard key={entry.id} entry={entry} position={index + 1} onOpenFile={() => void openFile(entry.id)} onOpenFolder={() => void openFolder(entry.id)} onRemove={() => void removeHistoryEntry(entry.id)} />)}</div>}</section> : <section className="panel secondary-view"><h1>ACERCA DE</h1><p>YT Download usa yt-dlp, FFmpeg, ffprobe y Deno empaquetados localmente para analizar y procesar tus descargas.</p><FolderOpen size={28} /></section>}
+          </> : activeView === "settings" ? <section className="panel diagnostics-panel"><header><div><h1>CONFIGURACIÓN</h1><p>DIAGNÓSTICO DEL MOTOR</p></div><button className="secondary-button" onClick={() => void refreshEngines()}><LoaderCircle size={16} />VOLVER A COMPROBAR</button></header><section className="youtube-access-setting"><div><strong>ACCESO A YOUTUBE</strong><p>Elegí una sesión local sólo si YouTube bloquea el acceso público. La app no guarda, copia ni muestra contraseñas o cookies.</p></div><label className="select-field"><span>Sesión para YouTube</span><div className="select-wrap"><select aria-label="Sesión local para YouTube" value={youtubeAccessMode} onChange={(event) => setYoutubeAccessMode(event.target.value as YoutubeAccessMode)}><option value="public">SOLO ACCESO PÚBLICO</option><option value="chrome">USAR SESIÓN LOCAL DE CHROME</option><option value="edge">USAR SESIÓN LOCAL DE EDGE</option></select><ChevronDown size={15} /></div><small>Se usará exclusivamente al analizar y descargar videos de YouTube.</small></label></section><div className="diagnostic-list">{engines.map((engine) => <article key={engine.name}><span className={engine.state === "available" ? "engine-dot is-active" : engine.state === "checking" ? "engine-dot is-checking" : "engine-dot is-unavailable"} /><div><strong>{engine.name}</strong><p>Estado: {engine.state === "available" ? "Activo" : engine.state === "checking" ? "Comprobando" : "No disponible"}</p><p>Versión: {engine.version ?? "—"}</p><p className="diagnostic-path">Ruta: {engine.path ?? engine.detail ?? "—"}</p></div></article>)}</div></section> : activeView === "history" ? <section className="panel history-panel"><header className="section-header"><div><p className="eyebrow">HISTORIAL RECIENTE</p><span>Descargas persistidas localmente.</span></div></header>{history.length === 0 ? <div className="queue-empty"><History size={27} /><strong>SIN DESCARGAS COMPLETADAS</strong><span>Cuando una descarga termine correctamente,<br />aparecerá aquí incluso después de reiniciar.</span></div> : <div className="queue-list">{history.map((entry, index) => <HistoryEntryCard key={entry.id} entry={entry} position={index + 1} onOpenFile={() => void openFile(entry.id)} onOpenFolder={() => void openFolder(entry.id)} onRemove={() => void removeHistoryEntry(entry.id)} />)}</div>}</section> : <section className="panel secondary-view"><h1>ACERCA DE</h1><p>YT Download usa yt-dlp, FFmpeg, ffprobe y Deno empaquetados localmente para analizar y procesar tus descargas.</p><FolderOpen size={28} /></section>}
         </section>
       </div>
     </main>
