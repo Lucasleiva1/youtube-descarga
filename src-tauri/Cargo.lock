@@ -5361,7 +5361,7 @@ dependencies = [
 
 [[package]]
 name = "yt-download"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "rusqlite",
  "serde",
