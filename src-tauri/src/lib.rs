@@ -259,6 +259,8 @@ fn cancel_download_job(app: tauri::AppHandle, job_id: String) -> Result<(), Stri
 #[tauri::command]
 fn cancel_all_downloads(app: tauri::AppHandle) -> Result<(), String> { download::cancel_all(app) }
 #[tauri::command]
+fn clear_finished_downloads(app: tauri::AppHandle) -> Result<(), String> { download::clear_finished(app) }
+#[tauri::command]
 fn retry_download_job(app: tauri::AppHandle, job_id: String) -> Result<(), String> { download::retry(app, job_id) }
 #[tauri::command]
 fn open_download_file(app: tauri::AppHandle, job_id: String) -> Result<(), String> { download::open_file(app, job_id) }
@@ -271,6 +273,7 @@ fn remove_history_entry(app: tauri::AppHandle, id: String) -> Result<(), String>
 
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
@@ -287,7 +290,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![check_engines, analyze_urls, default_download_directory, add_download_job, get_download_queue, start_download_queue, start_download_job, pause_download_queue, resume_download_queue, cancel_download_job, cancel_all_downloads, retry_download_job, open_download_file, open_download_folder, get_history, remove_history_entry])
+        .invoke_handler(tauri::generate_handler![check_engines, analyze_urls, default_download_directory, add_download_job, get_download_queue, start_download_queue, start_download_job, pause_download_queue, resume_download_queue, cancel_download_job, cancel_all_downloads, clear_finished_downloads, retry_download_job, open_download_file, open_download_folder, get_history, remove_history_entry])
         .build(tauri::generate_context!())
         .expect("error while building YT Download");
 

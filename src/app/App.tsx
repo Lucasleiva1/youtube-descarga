@@ -1,10 +1,12 @@
 import { open } from "@tauri-apps/plugin-dialog";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   CheckCircle2,
   ChevronDown,
+  Clipboard,
   Clock3,
   Download,
   FileText,
@@ -22,6 +24,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import logoImage from "../assets/yt-downloader-app-icon.png";
 import { formatBytes, formatDuration, formatEta, formatSpeed, qualityLabel } from "../lib/formatters";
 import { useDownloadStore } from "../stores/downloadStore";
 import type {
@@ -40,7 +43,10 @@ import type {
 } from "../types/download";
 
 const defaultDestination = "Elegí una carpeta de destino";
-const defaultSelection: DownloadSelection = { qualityHeight: null, container: "auto" };
+function defaultSelectionFor(video: AnalyzedVideo): DownloadSelection {
+  const highestQuality = video.qualities.reduce<number | null>((highest, quality) => highest === null || quality.height > highest ? quality.height : highest, null);
+  return { qualityHeight: highestQuality, container: "mp4" };
+}
 
 function errorMessage(reason: unknown, fallback: string): string {
   if (typeof reason === "string") return reason;
@@ -139,7 +145,8 @@ interface VideoCardProps {
 
 function VideoCard({ video, selection, alreadyQueued, onSelectionChange, onAdd, onRemove }: VideoCardProps) {
   const qualities = useMemo(() => [...video.qualities].sort((left, right) => right.height - left.height), [video.qualities]);
-  const selected = qualities.find((option) => option.height === selection.qualityHeight);
+  const selectedHeight = selection.qualityHeight ?? qualities[0]?.height ?? null;
+  const selected = qualities.find((option) => option.height === selectedHeight);
 
   return (
     <article className="video-card">
@@ -157,25 +164,24 @@ function VideoCard({ video, selection, alreadyQueued, onSelectionChange, onAdd, 
         <div className="select-wrap">
           <select
             aria-label={`Resolución para ${video.title}`}
-            value={selection.qualityHeight === null ? "best" : String(selection.qualityHeight)}
-            onChange={(event) => onSelectionChange({ qualityHeight: event.target.value === "best" ? null : Number(event.target.value) })}
+            value={selectedHeight === null ? "" : String(selectedHeight)}
+            onChange={(event) => onSelectionChange({ qualityHeight: Number(event.target.value) })}
           >
-            <option value="best">MEJOR CALIDAD</option>
+            {qualities.length === 0 && <option value="">SIN CALIDAD DISPONIBLE</option>}
             {qualities.map((option) => <option key={option.height} value={option.height}>{option.label}</option>)}
           </select>
           <ChevronDown size={15} />
         </div>
-        <small>{selection.qualityHeight === null ? "Mejor video + audio disponibles" : `${selected?.videoFormats.length ?? 0} stream${selected?.videoFormats.length === 1 ? "" : "s"} detectados`}</small>
+        <small>{selected ? `${selected.videoFormats.length} stream${selected.videoFormats.length === 1 ? "" : "s"} detectados` : "Calidad no disponible"}</small>
       </label>
       <label className="select-field compact">
         <span>Formato</span>
         <div className="select-wrap">
           <select
             aria-label={`Formato para ${video.title}`}
-            value={selection.container}
+            value={selection.container === "auto" ? "mp4" : selection.container}
             onChange={(event) => onSelectionChange({ container: event.target.value as DownloadContainer })}
           >
-            <option value="auto">Auto</option>
             <option value="mp4">MP4</option>
             <option value="mkv">MKV</option>
             <option value="webm">WEBM</option>
@@ -401,6 +407,48 @@ export function App() {
     }
   }
 
+  async function pasteLinks() {
+    setError(undefined);
+    try {
+      const clipboardText = (await readText()).trim();
+      if (!clipboardText) {
+        setNotice("El portapapeles no contiene texto para pegar.");
+        return;
+      }
+      setUrls((current) => current.trim() ? `${current.trimEnd()}\n${clipboardText}` : clipboardText);
+      setNotice("Link pegado desde el portapapeles.");
+    } catch (reason) {
+      setError(errorMessage(reason, "No se pudo leer el portapapeles."));
+    }
+  }
+
+  function clearLinks() {
+    setUrls("");
+    setError(undefined);
+    setNotice("Se limpiaron los links pegados.");
+  }
+
+  async function clearDownloadSession() {
+    setError(undefined);
+    if (activeJobs.length > 0 || waitingJobs.length > 0) {
+      setError("Esperá a que terminen o cancelá las descargas pendientes antes de limpiar la sesión.");
+      return;
+    }
+    setQueueActionRunning(true);
+    try {
+      await invoke<void>("clear_finished_downloads");
+      setUrls("");
+      setVideos([]);
+      setAnalysisFailures([]);
+      setNotice("Sesión limpia. Tus archivos descargados y el historial se conservaron.");
+      await refreshQueue();
+    } catch (reason) {
+      setError(errorMessage(reason, "No se pudo limpiar la sesión de descargas."));
+    } finally {
+      setQueueActionRunning(false);
+    }
+  }
+
   async function chooseDestination() {
     try {
       const folder = await open({ directory: true, multiple: false, title: "Elegí dónde guardar las descargas" });
@@ -477,7 +525,7 @@ export function App() {
       setError("Elegí una carpeta de destino antes de agregar una descarga.");
       return false;
     }
-    const selection = selections[video.id] ?? defaultSelection;
+    const selection = selections[video.id] ?? defaultSelectionFor(video);
     const request: AddDownloadJobRequest = {
       videoId: video.id,
       url: video.url,
@@ -644,7 +692,7 @@ export function App() {
   return (
     <main className="app-shell">
       <header className="app-header" data-tauri-drag-region>
-        <div className="brand" data-tauri-drag-region><span className="play-mark"><Play size={16} fill="currentColor" /></span><strong><em>YT</em> DOWNLOAD</strong><small>v0.1.1-rc.2</small></div>
+        <div className="brand" data-tauri-drag-region><span className="brand-logo" title="YT Downloader"><img src={logoImage} alt="Logo YT Downloader" /></span><strong><em>YT</em> DOWNLOAD</strong><small>v0.1.1-rc.3</small></div>
         <div className="engines" data-tauri-drag-region>{engines.filter((engine) => engine.name === "yt-dlp" || engine.name === "ffmpeg").map((engine) => <EngineBadge engine={engine} key={engine.name} />)}</div>
       </header>
 
@@ -668,7 +716,12 @@ export function App() {
             <section className="url-panel panel">
               <p className="eyebrow">1. PEGÁ TUS LINKS DE YOUTUBE</p>
               <div className="url-entry">
-                <textarea value={urls} onChange={(event) => setUrls(event.target.value)} placeholder={"https://www.youtube.com/watch?v=…\nhttps://www.youtube.com/watch?v=…\n\nUn link por línea"} />
+                <div className="link-input-stage">
+                  <div className="link-input-toolbar">
+                    <div><button className="subtle-button" onClick={() => void pasteLinks()}><Clipboard size={15} />PEGAR</button><button className="icon-button clear-links-button" disabled={!urls.trim()} onClick={clearLinks} title="Limpiar todos los links" aria-label="Limpiar todos los links"><Trash2 size={17} /></button></div>
+                  </div>
+                  <textarea aria-label="Links de YouTube, uno por línea" value={urls} onChange={(event) => setUrls(event.target.value)} placeholder={"https://www.youtube.com/watch?v=…\nhttps://www.youtube.com/watch?v=…\n\nUn link por línea"} />
+                </div>
                 <button className="primary-button" disabled={isAnalyzing || !engineReady} onClick={() => void analyzeVideos()}><Search size={23} />{isAnalyzing ? "ANALIZANDO…" : "ANALIZAR VIDEOS"}</button>
               </div>
               {error && <p className="message error"><XCircle size={16} />{error}</p>}
@@ -682,7 +735,7 @@ export function App() {
                 <header className="section-header"><div><p className="eyebrow">2. VIDEOS ENCONTRADOS {videos.length > 0 ? `(${videos.length})` : ""}</p><span>Calidades detectadas directamente desde la fuente.</span></div><button className="secondary-button" disabled={videos.length === 0 || isQueueActionRunning || !engineReady || !hasDestination} onClick={() => void addAllToQueue()}><Plus size={17} />Agregar todos a la cola</button></header>
                 {videos.length === 0 ? <div className="empty-state"><Download size={30} /><h2>PEGÁ TUS LINKS<br />PARA EMPEZAR</h2><p>Podés agregar uno o varios videos.<br />Cada link debe ir en una línea separada.</p></div> : <div className="video-list">{videos.map((video) => {
                   const alreadyQueued = jobs.some((job) => job.videoId === video.id && job.status !== "completed" && job.status !== "failed" && job.status !== "cancelled");
-                  return <VideoCard key={video.id} video={video} selection={selections[video.id] ?? defaultSelection} alreadyQueued={alreadyQueued || addingVideoIds.includes(video.id)} onSelectionChange={(selection) => setSelection(video.id, selection)} onAdd={() => void addVideoToQueue(video)} onRemove={() => removeVideo(video.id)} />;
+                  return <VideoCard key={video.id} video={video} selection={selections[video.id] ?? defaultSelectionFor(video)} alreadyQueued={alreadyQueued || addingVideoIds.includes(video.id)} onSelectionChange={(selection) => setSelection(video.id, selection)} onAdd={() => void addVideoToQueue(video)} onRemove={() => removeVideo(video.id)} />;
                 })}</div>}
               </section>
 
@@ -696,6 +749,7 @@ export function App() {
             <section className="download-stage">
               <header className="download-stage-heading">
                 <div><p className="eyebrow">4. DESCARGA Y PROGRESO</p><span>El estado de la descarga aparece aquí mientras se procesa.</span></div>
+                <button className="subtle-button clear-session-button" disabled={jobs.length === 0 || activeJobs.length > 0 || waitingJobs.length > 0 || isQueueActionRunning} onClick={() => void clearDownloadSession()}><Trash2 size={15} />LIMPIAR SESIÓN</button>
               </header>
               <div className="bottom-grid">
               <article className="panel activity-panel"><p className="eyebrow">ACTIVIDAD ACTUAL</p>{activeJob ? <div className="activity-live"><LoaderCircle size={20} /><div><strong>{activeJob.status === "processing" ? "Procesando video…" : "Descargando video…"}</strong><span>{activeJob.message ?? activeJob.title}</span><small>{activeJob.status === "downloading" && activeJob.progress.speed !== null ? `Velocidad ${formatSpeed(activeJob.progress.speed)}` : activeJob.status === "processing" ? "Fusionando video + audio" : "Esperando datos de yt-dlp"}</small></div></div> : <div className="activity-idle"><LoaderCircle size={20} /><span>El motor estará listo para procesar cuando agregues videos a la cola.</span></div>}</article>

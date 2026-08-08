@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Permissions for the main application window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "updater:default"]
+  "permissions": ["core:default", "dialog:default", "updater:default", "clipboard-manager:allow-read-text"]
 }

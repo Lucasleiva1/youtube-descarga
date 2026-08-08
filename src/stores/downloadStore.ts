@@ -18,8 +18,9 @@ const emptyProgress = {
   totalBytes: null,
 };
 
-function defaultSelection(): DownloadSelection {
-  return { qualityHeight: null, container: "auto" };
+function defaultSelection(video?: AnalyzedVideo): DownloadSelection {
+  const highestQuality = video?.qualities.reduce<number | null>((highest, quality) => highest === null || quality.height > highest ? quality.height : highest, null) ?? null;
+  return { qualityHeight: highestQuality, container: "mp4" };
 }
 
 function normalizeJob(job: DownloadJob): DownloadJob {
@@ -72,7 +73,7 @@ export const useDownloadStore = create<DownloadStore>((set) => ({
       const current = state.selections[video.id];
       const stillAvailable = current?.qualityHeight === null
         || video.qualities.some((quality) => quality.height === current?.qualityHeight);
-      return [video.id, current && stillAvailable ? current : defaultSelection()];
+      return [video.id, current && stillAvailable ? { ...current, container: current.container === "auto" ? "mp4" : current.container } : defaultSelection(video)];
     }));
     return { videos, selections };
   }),

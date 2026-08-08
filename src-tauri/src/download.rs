@@ -304,6 +304,18 @@ pub fn cancel_all(app: AppHandle) -> Result<(), String> {
     for id in ids { let _ = cancel(app.clone(), id); }
     pause(app); Ok(())
 }
+pub fn clear_finished(app: AppHandle) -> Result<(), String> {
+    let manager = app.state::<DownloadManager>();
+    {
+        let mut state = manager.state.lock().map_err(|_| "No se pudo bloquear la cola.".to_owned())?;
+        if state.worker_running || state.jobs.iter().any(|job| matches!(job.status, DownloadStatus::Queued | DownloadStatus::Pending | DownloadStatus::Downloading | DownloadStatus::Processing)) {
+            return Err("Esperá a que terminen o cancelá las descargas pendientes antes de limpiar la sesión.".to_owned());
+        }
+        state.jobs.retain(|job| !matches!(job.status, DownloadStatus::Completed | DownloadStatus::Failed | DownloadStatus::Cancelled));
+    }
+    emit_queue(&app);
+    Ok(())
+}
 pub fn retry(app: AppHandle, job_id: String) -> Result<(), String> {
     let should_resume = {
         let manager = app.state::<DownloadManager>();
