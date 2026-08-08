@@ -9,6 +9,8 @@ use std::process::Command;
 use tauri::Manager;
 use url::Url;
 
+const YOUTUBE_BROWSER_RECOVERY_INSTRUCTIONS: &str = "No se pudo validar este video con el acceso público. En Configuración > Acceso a YouTube, elegí Chrome o Edge donde ya usás YouTube; después volvé a Descargas y analizá el enlace nuevamente.";
+
 /// Starts sidecar executables without allowing Windows to create a visible
 /// console window for them. yt-dlp, FFmpeg and Deno are console programs, but
 /// their output is captured and shown in the application's own interface.
@@ -434,8 +436,10 @@ fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>, browser_session: Optio
         }
         if !output.status.success() {
             let technical = String::from_utf8_lossy(&output.stderr);
-            let requires_browser_session = !pot_attempted && youtube_requires_browser_session(&technical);
-            let message = if pot_attempted {
+            let requires_browser_session = youtube_requires_browser_session(&technical);
+            let message = if pot_attempted && requires_browser_session {
+                YOUTUBE_BROWSER_RECOVERY_INSTRUCTIONS.to_owned()
+            } else if pot_attempted {
                 "El verificador local de YouTube no pudo validar este enlace. Comprobá tu conexión y reintentá.".to_owned()
             } else {
                 youtube_failure_message(&technical, browser_session.as_deref())
@@ -493,7 +497,7 @@ fn remove_history_entry(app: tauri::AppHandle, id: String) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_video, youtube_failure_message, youtube_requires_browser_session};
+    use super::{parse_video, youtube_failure_message, youtube_requires_browser_session, YOUTUBE_BROWSER_RECOVERY_INSTRUCTIONS};
     use serde_json::json;
 
     #[test]
@@ -549,6 +553,12 @@ mod tests {
     fn keeps_the_browser_recovery_flag_for_youtube_antibot_challenges() {
         assert!(youtube_requires_browser_session("ERROR: Sign in to confirm you’re not a bot"));
         assert!(!youtube_requires_browser_session("ERROR: Could not copy Chrome cookie database"));
+    }
+
+    #[test]
+    fn explains_the_manual_browser_recovery_path_after_local_verification_fails() {
+        assert!(YOUTUBE_BROWSER_RECOVERY_INSTRUCTIONS.contains("Configuración > Acceso a YouTube"));
+        assert!(YOUTUBE_BROWSER_RECOVERY_INSTRUCTIONS.contains("Chrome o Edge"));
     }
 }
 

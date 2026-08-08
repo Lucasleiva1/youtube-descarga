@@ -1,6 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
@@ -141,7 +142,7 @@ function UpdatePanel({ state, version, message, onCheck, onInstall }: UpdatePane
     <section className="update-panel">
       <div>
         <p className="eyebrow">ACTUALIZACIONES</p>
-        <span>Al abrir la app se buscan e instalan automáticamente las versiones firmadas de GitHub Releases.</span>
+        <span>Al abrir la app se buscan actualizaciones firmadas. La descarga e instalación sólo comienzan con tu confirmación.</span>
       </div>
       <div className="update-actions">
         <button className="secondary-button" disabled={checking || downloading} onClick={onCheck}><Search size={16} />{checking ? "BUSCANDO…" : "BUSCAR ACTUALIZACIÓN"}</button>
@@ -149,6 +150,32 @@ function UpdatePanel({ state, version, message, onCheck, onInstall }: UpdatePane
       </div>
       {message && <p className={`update-message ${state === "error" ? "error" : state === "available" ? "available" : ""}`}>{message}</p>}
     </section>
+  );
+}
+
+interface UpdatePromptProps {
+  version?: string;
+  message?: string;
+  onInstall: () => void;
+  onDismiss: () => void;
+}
+
+function UpdatePrompt({ version, message, onInstall, onDismiss }: UpdatePromptProps) {
+  return (
+    <div className="update-prompt-backdrop" role="presentation">
+      <section className="update-prompt" role="dialog" aria-modal="true" aria-labelledby="update-prompt-title">
+        <div className="update-prompt-icon"><Download size={22} /></div>
+        <div>
+          <p className="eyebrow">ACTUALIZACIÓN DISPONIBLE</p>
+          <h2 id="update-prompt-title">Hay una nueva versión lista para instalar</h2>
+          <p>{version ? `Se encontró la versión ${version}.` : "Se encontró una nueva versión."} {message}</p>
+          <div className="update-prompt-actions">
+            <button className="secondary-button" onClick={onDismiss}>MÁS TARDE</button>
+            <button className="primary-button small" onClick={onInstall}><Download size={16} />ACTUALIZAR AHORA</button>
+          </div>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -330,9 +357,12 @@ export function App() {
   const [updaterState, setUpdaterState] = useState<UpdaterState>("idle");
   const [updateVersion, setUpdateVersion] = useState<string>();
   const [updateMessage, setUpdateMessage] = useState<string>();
+  const [isUpdatePromptOpen, setUpdatePromptOpen] = useState(false);
+  const [appVersion, setAppVersion] = useState<string>();
   const [youtubeAccessMode, setYoutubeAccessMode] = useState<YoutubeAccessMode>(savedYoutubeAccessMode);
 
   useEffect(() => {
+    void getVersion().then(setAppVersion).catch(() => undefined);
     void invoke<EngineInfo[]>("check_engines")
       .then(setEngines)
       .catch(() => setEngines([
@@ -378,7 +408,7 @@ export function App() {
   }, [applyDownloadEvent, setHistory, setQueueSnapshot]);
 
   useEffect(() => {
-    void checkForUpdates(true, true);
+    void checkForUpdates({ silent: true, showPromptWhenAvailable: true });
     return () => {
       const update = pendingUpdateRef.current;
       pendingUpdateRef.current = null;
@@ -449,11 +479,6 @@ export function App() {
     }
   }
 
-  function retryAnalysisWithBrowser(browser: BrowserSession) {
-    selectYoutubeAccessMode(browser);
-    void analyzeVideos(browser);
-  }
-
   async function pasteLinks() {
     setError(undefined);
     try {
@@ -514,7 +539,7 @@ export function App() {
     }
   }
 
-  async function checkForUpdates(silent = false, installWhenAvailable = false) {
+  async function checkForUpdates({ silent = false, showPromptWhenAvailable = true }: { silent?: boolean; showPromptWhenAvailable?: boolean } = {}) {
     setUpdaterState("checking");
     setUpdateMessage(undefined);
     try {
@@ -526,6 +551,7 @@ export function App() {
       if (!update) {
         setUpdateVersion(undefined);
         setUpdaterState("idle");
+        setUpdatePromptOpen(false);
         if (!silent) setUpdateMessage("Ya tenés instalada la versión más reciente.");
         return;
       }
@@ -533,7 +559,7 @@ export function App() {
       setUpdateVersion(update.version);
       setUpdaterState("available");
       setUpdateMessage(update.body?.trim() || `Hay una nueva versión disponible: ${update.version}.`);
-      if (installWhenAvailable) await installUpdate();
+      setUpdatePromptOpen(showPromptWhenAvailable);
     } catch (reason) {
       setUpdateVersion(undefined);
       setUpdaterState("error");
@@ -547,6 +573,7 @@ export function App() {
       await checkForUpdates();
       return;
     }
+    setUpdatePromptOpen(false);
     setUpdaterState("downloading");
     setUpdateMessage("Descargando y verificando la actualización…");
     try {
@@ -744,7 +771,7 @@ export function App() {
   return (
     <main className="app-shell">
       <header className="app-header" data-tauri-drag-region>
-        <div className="brand" data-tauri-drag-region><span className="brand-logo" title="YT Downloader"><img src={logoImage} alt="Logo YT Downloader" /></span><strong><em>YT</em> DOWNLOAD</strong><small>v0.1.1-rc.5</small></div>
+        <div className="brand" data-tauri-drag-region><span className="brand-logo" title="YT Downloader"><img src={logoImage} alt="Logo YT Downloader" /></span><strong><em>YT</em> DOWNLOAD</strong>{appVersion && <small>v{appVersion}</small>}</div>
         <div className="engines" data-tauri-drag-region>{engines.filter((engine) => engine.name === "yt-dlp" || engine.name === "ffmpeg").map((engine) => <EngineBadge engine={engine} key={engine.name} />)}</div>
       </header>
 
@@ -778,7 +805,7 @@ export function App() {
               </div>
               {error && <p className="message error"><XCircle size={16} />{error}</p>}
               {notice && <p className="message success"><CheckCircle2 size={16} />{notice}</p>}
-              {browserRecoveryFailure && <div className="youtube-recovery"><Info size={18} /><div><strong>YOUTUBE PIDIÓ UNA VERIFICACIÓN</strong><p>Elegí el navegador donde usás YouTube y la app reintentará ahora mismo. La elección se recordará para tus próximos análisis; no se guardan ni exportan cookies.</p><div><button className="secondary-button" disabled={isAnalyzing} onClick={() => retryAnalysisWithBrowser("chrome")}>REINTENTAR CON CHROME</button><button className="secondary-button" disabled={isAnalyzing} onClick={() => retryAnalysisWithBrowser("edge")}>REINTENTAR CON EDGE</button></div></div></div>}
+              {browserRecoveryFailure && <div className="youtube-recovery"><Info size={18} /><div><strong>SE NECESITA UNA SESIÓN DE YOUTUBE</strong><p>{browserRecoveryFailure.message}</p><ol className="youtube-recovery-steps"><li>Abrí <strong>Configuración</strong>.</li><li>En <strong>Acceso a YouTube</strong>, elegí Chrome o Edge donde ya usás YouTube.</li><li>Volvé a <strong>Descargas</strong> y presioná <strong>Analizar videos</strong>.</li></ol><button className="secondary-button" disabled={isAnalyzing} onClick={() => setActiveView("settings")}>IR A CONFIGURACIÓN</button></div></div>}
               {analysisFailures.filter((failure) => !failure.requiresBrowserSession).length > 0 && <div className="analysis-failures">{analysisFailures.filter((failure) => !failure.requiresBrowserSession).map((failure, index) => <p key={`${failure.url}-${index}`}><XCircle size={14} /><span>{failure.url}</span>{failure.message}</p>)}</div>}
               {!engineReady && <p className="engine-warning"><Info size={15} /> Para analizar y descargar, yt-dlp, FFmpeg, ffprobe y Deno deben estar activos.</p>}
             </section>
@@ -809,9 +836,10 @@ export function App() {
               <article className="panel progress-panel"><p className="eyebrow">PROGRESO GENERAL</p><div className="progress-idle"><span>{queueProgress}%</span><div><i style={{ width: `${queueProgress}%` }} /></div><small>{jobs.length === 0 ? "No hay descargas activas" : `${completedJobs.length} de ${jobs.length} trabajo${jobs.length === 1 ? "" : "s"} completado${completedJobs.length === 1 ? "" : "s"}`}</small></div></article>
               </div>
             </section>
-          </> : activeView === "settings" ? <section className="panel diagnostics-panel"><header><div><h1>CONFIGURACIÓN</h1><p>DIAGNÓSTICO DEL MOTOR</p></div><button className="secondary-button" onClick={() => void refreshEngines()}><LoaderCircle size={16} />VOLVER A COMPROBAR</button></header><section className="youtube-access-setting"><div><strong>ACCESO A YOUTUBE</strong><p>Elegí una sesión local sólo si YouTube bloquea el acceso público. La app no guarda, copia ni muestra contraseñas o cookies.</p></div><label className="select-field"><span>Sesión para YouTube</span><div className="select-wrap"><select aria-label="Sesión local para YouTube" value={youtubeAccessMode} onChange={(event) => selectYoutubeAccessMode(event.target.value as YoutubeAccessMode)}><option value="public">SOLO ACCESO PÚBLICO</option><option value="chrome">USAR SESIÓN LOCAL DE CHROME</option><option value="edge">USAR SESIÓN LOCAL DE EDGE</option></select><ChevronDown size={15} /></div><small>Se usará exclusivamente al analizar y descargar videos de YouTube.</small></label></section><div className="diagnostic-list">{engines.map((engine) => <article key={engine.name}><span className={engine.state === "available" ? "engine-dot is-active" : engine.state === "checking" ? "engine-dot is-checking" : "engine-dot is-unavailable"} /><div><strong>{engine.name}</strong><p>Estado: {engine.state === "available" ? "Activo" : engine.state === "checking" ? "Comprobando" : "No disponible"}</p><p>Versión: {engine.version ?? "—"}</p><p className="diagnostic-path">Ruta: {engine.path ?? engine.detail ?? "—"}</p></div></article>)}</div></section> : activeView === "history" ? <section className="panel history-panel"><header className="section-header"><div><p className="eyebrow">HISTORIAL RECIENTE</p><span>Descargas persistidas localmente.</span></div></header>{history.length === 0 ? <div className="queue-empty"><History size={27} /><strong>SIN DESCARGAS COMPLETADAS</strong><span>Cuando una descarga termine correctamente,<br />aparecerá aquí incluso después de reiniciar.</span></div> : <div className="queue-list">{history.map((entry, index) => <HistoryEntryCard key={entry.id} entry={entry} position={index + 1} onOpenFile={() => void openFile(entry.id)} onOpenFolder={() => void openFolder(entry.id)} onRemove={() => void removeHistoryEntry(entry.id)} />)}</div>}</section> : <section className="panel secondary-view"><h1>ACERCA DE</h1><p>YT Download usa yt-dlp, FFmpeg, ffprobe y Deno empaquetados localmente para analizar y procesar tus descargas.</p><FolderOpen size={28} /></section>}
+          </> : activeView === "settings" ? <section className="panel diagnostics-panel"><header><div><h1>CONFIGURACIÓN</h1><p>DIAGNÓSTICO DEL MOTOR</p></div><button className="secondary-button" onClick={() => void refreshEngines()}><LoaderCircle size={16} />VOLVER A COMPROBAR</button></header><section className="youtube-access-setting"><div><strong>ACCESO A YOUTUBE</strong><p>Usá <strong>Solo acceso público</strong> normalmente. La app primero intenta una verificación local automática; elegí Chrome o Edge sólo si en Descargas aparece un aviso indicándotelo. La app no guarda, copia ni muestra contraseñas o cookies.</p></div><label className="select-field"><span>Sesión para YouTube</span><div className="select-wrap"><select aria-label="Sesión local para YouTube" value={youtubeAccessMode} onChange={(event) => selectYoutubeAccessMode(event.target.value as YoutubeAccessMode)}><option value="public">SOLO ACCESO PÚBLICO</option><option value="chrome">USAR SESIÓN LOCAL DE CHROME</option><option value="edge">USAR SESIÓN LOCAL DE EDGE</option></select><ChevronDown size={15} /></div><small>Elegí el navegador donde ya usás YouTube; después volvé a Descargas y analizá el enlace de nuevo.</small></label></section><div className="diagnostic-list">{engines.map((engine) => <article key={engine.name}><span className={engine.state === "available" ? "engine-dot is-active" : engine.state === "checking" ? "engine-dot is-checking" : "engine-dot is-unavailable"} /><div><strong>{engine.name}</strong><p>Estado: {engine.state === "available" ? "Activo" : engine.state === "checking" ? "Comprobando" : "No disponible"}</p><p>Versión: {engine.version ?? "—"}</p><p className="diagnostic-path">Ruta: {engine.path ?? engine.detail ?? "—"}</p></div></article>)}</div></section> : activeView === "history" ? <section className="panel history-panel"><header className="section-header"><div><p className="eyebrow">HISTORIAL RECIENTE</p><span>Descargas persistidas localmente.</span></div></header>{history.length === 0 ? <div className="queue-empty"><History size={27} /><strong>SIN DESCARGAS COMPLETADAS</strong><span>Cuando una descarga termine correctamente,<br />aparecerá aquí incluso después de reiniciar.</span></div> : <div className="queue-list">{history.map((entry, index) => <HistoryEntryCard key={entry.id} entry={entry} position={index + 1} onOpenFile={() => void openFile(entry.id)} onOpenFolder={() => void openFolder(entry.id)} onRemove={() => void removeHistoryEntry(entry.id)} />)}</div>}</section> : <section className="panel secondary-view"><h1>ACERCA DE</h1><p>YT Download usa yt-dlp, FFmpeg, ffprobe y Deno empaquetados localmente para analizar y procesar tus descargas.</p><FolderOpen size={28} /></section>}
         </section>
       </div>
+      {isUpdatePromptOpen && updaterState === "available" && <UpdatePrompt version={updateVersion} message={updateMessage} onInstall={() => void installUpdate()} onDismiss={() => setUpdatePromptOpen(false)} />}
     </main>
   );
 }

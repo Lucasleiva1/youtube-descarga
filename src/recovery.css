@@ -12,5 +12,6 @@
 .youtube-recovery > svg { flex: 0 0 auto; margin-top: 1px; }
 .youtube-recovery strong { display: block; color: #ffe2a1; font-size: 12px; }
 .youtube-recovery p { margin: 4px 0 10px; color: #d2c09a; font-size: 11px; line-height: 1.45; }
-.youtube-recovery div div { display: flex; flex-wrap: wrap; gap: 7px; }
+.youtube-recovery-steps { margin: 0 0 12px; padding-left: 18px; color: #d2c09a; font-size: 11px; line-height: 1.55; }
+.youtube-recovery-steps strong { display: inline; color: #ffe2a1; font-size: inherit; }
 .youtube-recovery .secondary-button { border-color: rgba(240, 191, 77, .5); color: #ffe9b7; background: #41331c; }
