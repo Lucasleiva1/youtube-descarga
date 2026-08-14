@@ -181,7 +181,7 @@ interface VideoCardProps {
 function VideoCard({ video, selection, alreadyQueued, onSelectionChange, onAdd, onRemove }: VideoCardProps) {
   const qualities = useMemo(() => [...video.qualities].sort((left, right) => right.height - left.height), [video.qualities]);
   const selected = qualities.find((option) => option.formatId === selection.selectedFormatId);
-  const resolutionValue = selection.compatibilityMode ? "__compatibility__" : selected?.formatId ?? "";
+  const resolutionValue = selected?.formatId ?? "";
 
   return (
     <article className="video-card">
@@ -200,23 +200,24 @@ function VideoCard({ video, selection, alreadyQueued, onSelectionChange, onAdd, 
           <select
             aria-label={`Resolución para ${video.title}`}
             value={resolutionValue}
+            disabled={qualities.length === 0}
             onChange={(event) => {
-              if (event.target.value === "__compatibility__") {
-                onSelectionChange({ qualityHeight: null, selectedFormatId: null, selectedFormatHasAudio: null, compatibilityMode: true });
-                return;
-              }
               const quality = qualities.find((option) => option.formatId === event.target.value);
-              if (quality) onSelectionChange({ qualityHeight: quality.height, selectedFormatId: quality.formatId, selectedFormatHasAudio: quality.formatHasAudio, compatibilityMode: false });
+              if (!quality) return;
+              onSelectionChange({
+                qualityHeight: quality.height,
+                selectedFormatId: quality.formatId,
+                selectedFormatHasAudio: quality.formatHasAudio,
+                compatibilityMode: false,
+              });
             }}
           >
             {qualities.length === 0 && <option value="">SIN CALIDAD ORIGINAL DISPONIBLE</option>}
             {qualities.map((option) => <option key={option.formatId} value={option.formatId}>{option.label}</option>)}
-            <option disabled>──────── Compatibilidad ────────</option>
-            <option value="__compatibility__">MEJOR CALIDAD COMPATIBLE (PUEDE SER INFERIOR)</option>
           </select>
           <ChevronDown size={15} />
         </div>
-        <small>{selection.compatibilityMode ? "No es una calidad verificada: yt-dlp elegirá la mejor fuente que pueda descargar, aunque sea inferior." : selected ? `${selected.videoFormats.length} stream${selected.videoFormats.length === 1 ? "" : "s"} originales detectados` : "No hay una calidad original verificable"}</small>
+        <small>{selected ? `${selected.videoFormats.length} fuente(s) original(es) disponible(s) en ${selected.height}p` : "No hay una calidad original verificable"}</small>
       </label>
       <label className="select-field compact">
         <span>Formato</span>
@@ -343,6 +344,9 @@ export function App() {
   const [isQueueActionRunning, setQueueActionRunning] = useState(false);
   const [addingVideoIds, setAddingVideoIds] = useState<string[]>([]);
   const addingVideoIdsRef = useRef(new Set<string>());
+  const analysisRetryTimerRef = useRef<number>();
+  const destinationRef = useRef(destination);
+  destinationRef.current = destination;
   const pendingUpdateRef = useRef<Update | null>(null);
   const [updaterState, setUpdaterState] = useState<UpdaterState>("idle");
   const [updateVersion, setUpdateVersion] = useState<string>();
@@ -410,6 +414,12 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => () => {
+    if (analysisRetryTimerRef.current !== undefined) {
+      window.clearTimeout(analysisRetryTimerRef.current);
+    }
+  }, []);
+
   const engineReady = ["yt-dlp", "ffmpeg", "ffprobe", "deno"].every((name) => engines.some((engine) => engine.name === name && engine.state === "available"));
   const validLines = useMemo(() => urls.split(/\r?\n/).map((line) => line.trim()).filter(Boolean), [urls]);
   const uniqueUrls = useMemo(() => [...new Set(validLines)], [validLines]);
@@ -434,11 +444,28 @@ export function App() {
     }
   }
 
-  async function analyzeVideos() {
+  function scheduleAutomaticAnalysisRetry(failures: AnalysisFailure[]) {
+    const retryable = failures.filter((failure) => failure.retryAfterEpoch);
+    if (analysisRetryTimerRef.current !== undefined) {
+      window.clearTimeout(analysisRetryTimerRef.current);
+      analysisRetryTimerRef.current = undefined;
+    }
+    if (retryable.length === 0) return;
+    const retryAfterEpoch = Math.max(...retryable.map((failure) => failure.retryAfterEpoch!));
+    const retryUrls = [...new Set(retryable.map((failure) => failure.url))];
+    const delay = Math.max(1_000, retryAfterEpoch * 1_000 - Date.now() + 1_000);
+    analysisRetryTimerRef.current = window.setTimeout(() => {
+      analysisRetryTimerRef.current = undefined;
+      void analyzeVideos(retryUrls, true, true);
+    }, delay);
+    setNotice(`Reintento automático programado para las ${new Intl.DateTimeFormat("es-AR", { timeStyle: "short" }).format(new Date(retryAfterEpoch * 1000))}.`);
+  }
+
+  async function analyzeVideos(urlsToAnalyze: string[] = uniqueUrls, ignoreHistory = false, autoQueue = false) {
     setError(undefined);
     setNotice(undefined);
     setAnalysisFailures([]);
-    if (uniqueUrls.length === 0) {
+    if (urlsToAnalyze.length === 0) {
       setError("Pegá al menos una URL de YouTube, una por línea.");
       return;
     }
@@ -448,11 +475,34 @@ export function App() {
     }
     setAnalyzing(true);
     try {
-      const result = await invoke<AnalysisResult>("analyze_urls", { urls: uniqueUrls });
+      const result = await invoke<AnalysisResult>("analyze_urls", {
+        urls: urlsToAnalyze,
+        ignoreHistory,
+      });
       setVideos(result.videos);
       setAnalysisFailures(result.failures);
+      scheduleAutomaticAnalysisRetry(result.failures);
       if (result.videos.length > 0) setNotice(`${result.videos.length} video${result.videos.length === 1 ? "" : "s"} analizado${result.videos.length === 1 ? "" : "s"}. Elegí la calidad y agregalo a la cola.`);
       if (result.videos.length === 0 && result.failures.length > 0 && !result.failures.some((failure) => failure.requiresBrowserSession)) setError("No se pudo analizar ninguna de las URLs ingresadas.");
+      if (autoQueue && result.videos.length > 0) {
+        const automaticDestination = destinationRef.current;
+        if (!automaticDestination || automaticDestination === defaultDestination) {
+          setNotice("El análisis automático terminó. Elegí una carpeta para iniciar la descarga.");
+          return;
+        }
+        let added = 0;
+        for (const video of result.videos) {
+          if (await addVideoToQueue(video, defaultSelectionFor(video), automaticDestination)) {
+            added += 1;
+          }
+        }
+        if (added > 0) {
+          await invoke<void>("start_download_queue");
+          setQueuePaused(false);
+          await refreshQueue();
+          setNotice("La pausa terminó: el análisis y la descarga se reanudaron automáticamente.");
+        }
+      }
     } catch (reason) {
       setError(errorMessage(reason, "No se pudieron analizar las URLs. Verificá que los motores estén disponibles."));
     } finally {
@@ -576,17 +626,22 @@ export function App() {
     }
   }
 
-  async function addVideoToQueue(video: AnalyzedVideo): Promise<boolean> {
+  async function addVideoToQueue(
+    video: AnalyzedVideo,
+    selectionOverride?: DownloadSelection,
+    destinationOverride?: string,
+  ): Promise<boolean> {
     setError(undefined);
     if (!engineReady) {
       setError("No se puede agregar a la cola: yt-dlp, FFmpeg, ffprobe y Deno deben estar activos.");
       return false;
     }
-    if (!hasDestination) {
+    const targetDestination = destinationOverride ?? destination;
+    if (!targetDestination || targetDestination === defaultDestination) {
       setError("Elegí una carpeta de destino antes de agregar una descarga.");
       return false;
     }
-    const selection = selections[video.id] ?? defaultSelectionFor(video);
+    const selection = selectionOverride ?? selections[video.id] ?? defaultSelectionFor(video);
     const request: AddDownloadJobRequest = {
       videoId: video.id,
       url: video.url,
@@ -601,7 +656,7 @@ export function App() {
       browserSession: video.browserSession ?? null,
       usePotProvider: video.usePotProvider,
       container: selection.container,
-      destination,
+      destination: targetDestination,
     };
     if (addingVideoIdsRef.current.has(video.id)) return false;
     addingVideoIdsRef.current.add(video.id);
@@ -793,8 +848,23 @@ export function App() {
               </div>
               {error && <p className="message error"><XCircle size={16} />{error}</p>}
               {notice && <p className="message success"><CheckCircle2 size={16} />{notice}</p>}
-              {accountAccessFailure && <div className="youtube-recovery"><Info size={18} /><div><strong>ESTE CONTENIDO REQUIERE UNA CUENTA DE YOUTUBE</strong><p>{accountAccessFailure.message}</p><p>La app ya probó automáticamente los accesos disponibles. Iniciá sesión en YouTube en un navegador compatible y volvé a analizar el enlace.</p><button className="secondary-button" disabled={isAnalyzing} onClick={() => void analyzeVideos()}><RotateCcw size={14} />VOLVER A ANALIZAR</button></div></div>}
-              {analysisFailures.filter((failure) => !failure.requiresBrowserSession).length > 0 && <div className="analysis-failures">{analysisFailures.filter((failure) => !failure.requiresBrowserSession).map((failure, index) => <p key={`${failure.url}-${index}`}><XCircle size={14} /><span>{failure.url}</span>{failure.message}</p>)}</div>}
+              {accountAccessFailure && <div className="youtube-recovery"><Info size={18} /><div><strong>ESTE CONTENIDO REQUIERE UNA CUENTA DE YOUTUBE</strong><p>{accountAccessFailure.message}</p><p>La app permanece anónima y no leerá cookies ni sesiones de Edge, Chrome, Firefox o Brave.</p></div></div>}
+              {analysisFailures.filter((failure) => !failure.requiresBrowserSession).length > 0 && (
+                <div className="analysis-failures">
+                  {analysisFailures.filter((failure) => !failure.requiresBrowserSession).map((failure, index) => (
+                    <div className="analysis-failure" key={`${failure.url}-${index}`}>
+                      <p><XCircle size={14} /><span>{failure.url}</span>{failure.message}</p>
+                      {failure.retryAfterEpoch && <small>Próximo intento permitido: {new Intl.DateTimeFormat("es-AR", { timeStyle: "short" }).format(new Date(failure.retryAfterEpoch * 1000))}</small>}
+                      {failure.existingDownloadId && (
+                        <div className="analysis-failure-actions">
+                          <button className="secondary-button" onClick={() => void openFile(failure.existingDownloadId!)}><FolderOpen size={14} />ABRIR ARCHIVO</button>
+                          <button className="secondary-button" disabled={isAnalyzing} onClick={() => void analyzeVideos([failure.url], true)}><RotateCcw size={14} />DESCARGAR OTRA VEZ</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
               {!engineReady && <p className="engine-warning"><Info size={15} /> Para analizar y descargar, yt-dlp, FFmpeg, ffprobe y Deno deben estar activos.</p>}
             </section>
 
@@ -824,7 +894,7 @@ export function App() {
               <article className="panel progress-panel"><p className="eyebrow">PROGRESO GENERAL</p><div className="progress-idle"><span>{queueProgress}%</span><div><i style={{ width: `${queueProgress}%` }} /></div><small>{jobs.length === 0 ? "No hay descargas activas" : `${completedJobs.length} de ${jobs.length} trabajo${jobs.length === 1 ? "" : "s"} completado${completedJobs.length === 1 ? "" : "s"}`}</small></div></article>
               </div>
             </section>
-          </> : activeView === "settings" ? <section className="panel diagnostics-panel"><header><div><h1>CONFIGURACIÓN</h1><p>DIAGNÓSTICO DEL MOTOR</p></div><button className="secondary-button" onClick={() => void refreshEngines()}><LoaderCircle size={16} />VOLVER A COMPROBAR</button></header><section className="youtube-access-setting"><div><strong>ACCESO AUTOMÁTICO A YOUTUBE</strong><p>La app elige el acceso adecuado para cada enlace. Los videos públicos se analizan sin leer ni tocar sesiones de tus navegadores. Solo busca una sesión local compatible cuando YouTube confirma que el contenido realmente requiere una cuenta.</p></div><div className="youtube-access-order" aria-label="Orden automático de acceso a YouTube"><span>ORDEN AUTOMÁTICO</span><ol><li>Acceso público</li><li>Verificación local incluida</li><li>Sesión compatible, solo si hace falta una cuenta</li></ol></div></section><div className="diagnostic-list">{engines.map((engine) => <article key={engine.name}><span className={engine.state === "available" ? "engine-dot is-active" : engine.state === "checking" ? "engine-dot is-checking" : "engine-dot is-unavailable"} /><div><strong>{engine.name}</strong><p>Estado: {engine.state === "available" ? "Activo" : engine.state === "checking" ? "Comprobando" : "No disponible"}</p><p>Versión: {engine.version ?? "—"}</p><p className="diagnostic-path">Ruta: {engine.path ?? engine.detail ?? "—"}</p></div></article>)}</div></section> : activeView === "history" ? <section className="panel history-panel"><header className="section-header"><div><p className="eyebrow">HISTORIAL RECIENTE</p><span>Descargas persistidas localmente.</span></div></header>{history.length === 0 ? <div className="queue-empty"><History size={27} /><strong>SIN DESCARGAS COMPLETADAS</strong><span>Cuando una descarga termine correctamente,<br />aparecerá aquí incluso después de reiniciar.</span></div> : <div className="queue-list">{history.map((entry, index) => <HistoryEntryCard key={entry.id} entry={entry} position={index + 1} onOpenFile={() => void openFile(entry.id)} onOpenFolder={() => void openFolder(entry.id)} onRemove={() => void removeHistoryEntry(entry.id)} />)}</div>}</section> : <section className="panel secondary-view"><h1>ACERCA DE</h1><p>YT Download usa yt-dlp, FFmpeg, ffprobe y Deno empaquetados localmente para analizar y procesar tus descargas.</p><FolderOpen size={28} /></section>}
+          </> : activeView === "settings" ? <section className="panel diagnostics-panel"><header><div><h1>CONFIGURACIÓN</h1><p>DIAGNÓSTICO DEL MOTOR</p></div><button className="secondary-button" onClick={() => void refreshEngines()}><LoaderCircle size={16} />VOLVER A COMPROBAR</button></header><section className="youtube-access-setting"><div><strong>ACCESO ANÓNIMO A YOUTUBE</strong><p>La app usa acceso público y, si hace falta, su verificación local incluida. Nunca lee cookies ni sesiones de tus navegadores; el contenido que exige una cuenta se rechaza sin intentar iniciar sesión.</p></div><div className="youtube-access-order" aria-label="Orden anónimo de acceso a YouTube"><span>ORDEN AUTOMÁTICO</span><ol><li>Acceso público</li><li>Verificación local incluida</li><li>Detenerse si exige una cuenta</li></ol></div></section><div className="diagnostic-list">{engines.map((engine) => <article key={engine.name}><span className={engine.state === "available" ? "engine-dot is-active" : engine.state === "checking" ? "engine-dot is-checking" : "engine-dot is-unavailable"} /><div><strong>{engine.name}</strong><p>Estado: {engine.state === "available" ? "Activo" : engine.state === "checking" ? "Comprobando" : "No disponible"}</p><p>Versión: {engine.version ?? "—"}</p><p className="diagnostic-path">Ruta: {engine.path ?? engine.detail ?? "—"}</p></div></article>)}</div></section> : activeView === "history" ? <section className="panel history-panel"><header className="section-header"><div><p className="eyebrow">HISTORIAL RECIENTE</p><span>Descargas persistidas localmente.</span></div></header>{history.length === 0 ? <div className="queue-empty"><History size={27} /><strong>SIN DESCARGAS COMPLETADAS</strong><span>Cuando una descarga termine correctamente,<br />aparecerá aquí incluso después de reiniciar.</span></div> : <div className="queue-list">{history.map((entry, index) => <HistoryEntryCard key={entry.id} entry={entry} position={index + 1} onOpenFile={() => void openFile(entry.id)} onOpenFolder={() => void openFolder(entry.id)} onRemove={() => void removeHistoryEntry(entry.id)} />)}</div>}</section> : <section className="panel secondary-view"><h1>ACERCA DE</h1><p>YT Download usa yt-dlp, FFmpeg, ffprobe y Deno empaquetados localmente para analizar y procesar tus descargas.</p><FolderOpen size={28} /></section>}
         </section>
       </div>
       {isUpdatePromptOpen && updaterState === "available" && <UpdatePrompt version={updateVersion} message={updateMessage} onInstall={() => void installUpdate()} onDismiss={() => setUpdatePromptOpen(false)} />}

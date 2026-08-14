@@ -1,6 +1,7 @@
 mod download;
 mod engine;
 mod history;
+mod youtube_access;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,7 +43,7 @@ struct EngineInfo {
     path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VideoFormat {
     id: String,
@@ -60,7 +61,7 @@ struct VideoFormat {
     has_audio: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QualityOption {
     height: u32,
@@ -70,7 +71,7 @@ struct QualityOption {
     video_formats: Vec<VideoFormat>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AnalyzedVideo {
     id: String,
@@ -94,6 +95,8 @@ struct AnalysisFailure {
     url: String,
     message: String,
     requires_browser_session: bool,
+    existing_download_id: Option<String>,
+    retry_after_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,10 +247,6 @@ impl YoutubeFailureClass {
         matches!(self, Self::AntiBotChallenge | Self::PotRequired)
     }
 
-    fn warrants_browser(self) -> bool {
-        matches!(self, Self::AccountRequired)
-    }
-
     fn is_account_requirement(self) -> bool {
         matches!(self, Self::AccountRequired)
     }
@@ -328,6 +327,35 @@ fn is_supported_youtube_url(value: &str) -> bool {
         || host == "www.youtu.be"
         || host == "youtube.com"
         || host.ends_with(".youtube.com")
+}
+
+fn youtube_video_id(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let candidate = if matches!(host.as_str(), "youtu.be" | "www.youtu.be") {
+        url.path_segments()?
+            .find(|segment| !segment.is_empty())?
+            .to_owned()
+    } else if host == "youtube.com" || host.ends_with(".youtube.com") {
+        let mut segments = url.path_segments()?;
+        match segments.next().filter(|segment| !segment.is_empty()) {
+            Some("watch") | None => url
+                .query_pairs()
+                .find_map(|(key, value)| (key == "v").then(|| value.into_owned()))?,
+            Some("shorts" | "embed" | "live" | "v") => segments.next()?.to_owned(),
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    let candidate = candidate.trim();
+    (6..=32)
+        .contains(&candidate.len())
+        .then(|| candidate.to_owned())
+        .filter(|id| {
+            id.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
 }
 
 /// Applies only the already-resolved access strategy. Strategy discovery lives
@@ -610,21 +638,15 @@ impl VideoFormat {
 fn parse_video(url: String, stdout: &[u8]) -> Result<AnalyzedVideo, String> {
     let data: Value = serde_json::from_slice(stdout)
         .map_err(|_| "yt-dlp devolvió metadata inválida.".to_owned())?;
-    let mut formats: Vec<VideoFormat> = data
-        .get("formats")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(to_video_format)
-        .collect();
-    formats.sort_by_key(|format| (format.height.unwrap_or(0), format.fps.unwrap_or(0.0) as u32));
     let downloadable_formats: Vec<VideoFormat> = data
         .get("formats")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|value| {
-            to_video_format(value).filter(|format| is_downloadable_video_format(value, format))
+            to_video_format(value).filter(|format| {
+                is_downloadable_video_format(value, format) && !format.id.ends_with("-sr")
+            })
         })
         .collect();
     let mut heights: Vec<u32> = downloadable_formats
@@ -666,7 +688,7 @@ fn parse_video(url: String, stdout: &[u8]) -> Result<AnalyzedVideo, String> {
         browser_session: None,
         use_pot_provider: false,
         qualities,
-        formats,
+        formats: downloadable_formats,
     })
 }
 
@@ -685,7 +707,7 @@ fn analysis_command(
             "--dump-single-json",
             "--skip-download",
             "--no-playlist",
-            "--check-formats",
+            "--force-ipv4",
             "--socket-timeout",
             "20",
             "--ffmpeg-location",
@@ -693,6 +715,7 @@ fn analysis_command(
         .arg(ffmpeg_directory)
         .arg("--js-runtimes")
         .arg(format!("deno:{}", deno.display()));
+    youtube_access::configure_extraction_pacing(&mut command);
     configure_youtube_access(&mut command, strategy);
     if let Some(provider) = provider {
         engine::configure_pot_provider(&mut command, provider);
@@ -779,6 +802,10 @@ fn run_analysis_attempt(
     engine_version: &str,
 ) -> Result<AnalyzedVideo, AnalysisAttemptFailure> {
     let started = Instant::now();
+    youtube_access::begin_network_operation(app).map_err(|message| AnalysisAttemptFailure {
+        class: YoutubeFailureClass::RateLimited,
+        message: Some(message),
+    })?;
     let result = (|| {
         let provider = if strategy.uses_pot_provider() {
             Some(engine::ensure_pot_provider(app, paths).map_err(|message| {
@@ -818,6 +845,7 @@ fn run_analysis_attempt(
         video.use_pot_provider = use_pot_provider;
         Ok(video)
     })();
+    youtube_access::finish_network_operation(app);
     let outcome = match &result {
         Ok(_) => "success",
         Err(failure) => failure.class.code(),
@@ -850,7 +878,7 @@ fn automatic_failure(url: String, attempts: &[AnalysisAttemptFailure]) -> Analys
     .into_iter()
     .find_map(|class| attempts.iter().find(|attempt| attempt.class == class));
     let message = if requires_browser_session {
-        "YouTube exige una cuenta con acceso a este contenido. Se probaron automáticamente las sesiones locales compatibles, pero ninguna fue aceptada.".to_owned()
+        "Este contenido exige una cuenta. Por privacidad, la aplicación no lee ni usa sesiones de tus navegadores y no realizó solicitudes autenticadas.".to_owned()
     } else if let Some(failure) = terminal {
         failure
             .message
@@ -878,6 +906,8 @@ fn automatic_failure(url: String, attempts: &[AnalysisAttemptFailure]) -> Analys
         url,
         message,
         requires_browser_session,
+        existing_download_id: None,
+        retry_after_epoch: None,
     }
 }
 
@@ -890,7 +920,6 @@ fn analyze_url_automatically(
     deno: &std::path::Path,
     url: &str,
     engine_version: &str,
-    unusable_browsers: &mut HashSet<BrowserSession>,
 ) -> Result<AnalyzedVideo, AnalysisFailure> {
     let mut attempts = Vec::new();
     match run_analysis_attempt(
@@ -907,6 +936,9 @@ fn analyze_url_automatically(
         Err(failure) => attempts.push(failure),
     }
     let public_class = attempts[0].class;
+    if public_class == YoutubeFailureClass::RateLimited {
+        youtube_access::activate_cooldown(app, "rate_limited");
+    }
     if matches!(
         public_class,
         YoutubeFailureClass::Private
@@ -934,86 +966,23 @@ fn analyze_url_automatically(
             Ok(video) => return Ok(video),
             Err(failure) => attempts.push(failure),
         }
-    }
-
-    let browser_needed = public_class.warrants_browser()
-        || attempts
-            .iter()
-            .any(|attempt| attempt.class.warrants_browser());
-    if !browser_needed {
-        return Err(automatic_failure(url.to_owned(), &attempts));
-    }
-
-    for browser in browser_fallback_order() {
-        if unusable_browsers.contains(&browser) {
-            continue;
-        }
-        let browser_strategy = YoutubeAccessStrategy::Browser {
-            browser,
-            use_pot_provider: false,
-        };
-        let browser_failure = match run_analysis_attempt(
-            app,
-            paths,
-            binary,
-            ffmpeg_directory,
-            deno,
-            url,
-            browser_strategy,
-            engine_version,
-        ) {
-            Ok(video) => return Ok(video),
-            Err(failure) => failure,
-        };
-        if matches!(
-            browser_failure.class,
-            YoutubeFailureClass::CookieDatabaseLocked
-                | YoutubeFailureClass::CookieDecryptUnsupported
-                | YoutubeFailureClass::BrowserMissing
-        ) {
-            unusable_browsers.insert(browser);
-        }
-        let try_combined = matches!(
-            browser_failure.class,
-            YoutubeFailureClass::AntiBotChallenge
-                | YoutubeFailureClass::PotRequired
-                | YoutubeFailureClass::SessionRejected
-        );
-        attempts.push(browser_failure);
-        if try_combined {
-            match run_analysis_attempt(
-                app,
-                paths,
-                binary,
-                ffmpeg_directory,
-                deno,
-                url,
-                YoutubeAccessStrategy::Browser {
-                    browser,
-                    use_pot_provider: true,
-                },
-                engine_version,
-            ) {
-                Ok(video) => return Ok(video),
-                Err(failure) => attempts.push(failure),
+        if let Some(pot_failure) = attempts.last() {
+            if pot_failure.class == YoutubeFailureClass::RateLimited
+                || (public_class == YoutubeFailureClass::AntiBotChallenge
+                    && pot_failure.class == YoutubeFailureClass::AntiBotChallenge)
+            {
+                youtube_access::activate_cooldown(app, pot_failure.class.code());
             }
         }
     }
-    Err(automatic_failure(url.to_owned(), &attempts))
-}
 
-fn browser_fallback_order() -> [BrowserSession; 4] {
-    [
-        BrowserSession::Firefox,
-        BrowserSession::Edge,
-        BrowserSession::Chrome,
-        BrowserSession::Brave,
-    ]
+    Err(automatic_failure(url.to_owned(), &attempts))
 }
 
 fn analyze_urls_blocking(
     app: tauri::AppHandle,
     urls: Vec<String>,
+    ignore_history: bool,
 ) -> Result<AnalysisResult, String> {
     let paths = engine::EnginePaths::resolve(&app);
     paths.required_for_youtube()?;
@@ -1029,20 +998,10 @@ fn analyze_urls_blocking(
     let engine_version = yt_dlp_version(binary);
     let mut videos = Vec::new();
     let mut failures = Vec::new();
-    let mut seen_urls = HashSet::new();
     let mut seen_video_ids = HashSet::new();
-    let mut unusable_browsers = HashSet::new();
     for url in urls {
         let clean_url = url.trim().to_owned();
         if clean_url.is_empty() {
-            continue;
-        }
-        if !seen_urls.insert(clean_url.clone()) {
-            failures.push(AnalysisFailure {
-                url: clean_url,
-                message: "URL duplicada: se omitió el análisis repetido.".to_owned(),
-                requires_browser_session: false,
-            });
             continue;
         }
         if !is_supported_youtube_url(&clean_url) {
@@ -1050,6 +1009,55 @@ fn analyze_urls_blocking(
                 url: clean_url,
                 message: "URL inválida o no compatible. Usá un enlace de YouTube.".to_owned(),
                 requires_browser_session: false,
+                existing_download_id: None,
+                retry_after_epoch: None,
+            });
+            continue;
+        }
+        let Some(video_id) = youtube_video_id(&clean_url) else {
+            failures.push(AnalysisFailure {
+                url: clean_url,
+                message: "No se pudo obtener localmente el ID del video. Usá un enlace directo de YouTube.".to_owned(),
+                requires_browser_session: false,
+                existing_download_id: None,
+                retry_after_epoch: None,
+            });
+            continue;
+        };
+        if !seen_video_ids.insert(video_id.clone()) {
+            failures.push(AnalysisFailure {
+                url: clean_url,
+                message: "El video está repetido en la lista; se omitió sin consultar YouTube."
+                    .to_owned(),
+                requires_browser_session: false,
+                existing_download_id: None,
+                retry_after_epoch: None,
+            });
+            continue;
+        }
+        if !ignore_history {
+            if let Some(existing) = history::find_existing_by_video_id(&app, &video_id)? {
+                failures.push(AnalysisFailure {
+                    url: clean_url,
+                    message: "Este video ya está descargado y el archivo sigue disponible. No se volvió a consultar YouTube.".to_owned(),
+                    requires_browser_session: false,
+                    existing_download_id: Some(existing.id),
+                    retry_after_epoch: None,
+                });
+                continue;
+            }
+        }
+        if let Some(video) = youtube_access::cached_analysis(&app, &video_id, &clean_url) {
+            videos.push(video);
+            continue;
+        }
+        if let Some(until) = youtube_access::cooldown_until(&app) {
+            failures.push(AnalysisFailure {
+                url: clean_url,
+                message: youtube_access::cooldown_message(until),
+                requires_browser_session: false,
+                existing_download_id: None,
+                retry_after_epoch: Some(until),
             });
             continue;
         }
@@ -1061,25 +1069,34 @@ fn analyze_urls_blocking(
             deno,
             &clean_url,
             &engine_version,
-            &mut unusable_browsers,
         ) {
-            Ok(video) if seen_video_ids.insert(video.id.clone()) => videos.push(video),
-            Ok(_) => failures.push(AnalysisFailure {
-                url: clean_url,
-                message: "El video ya fue analizado mediante otra URL.".to_owned(),
-                requires_browser_session: false,
-            }),
-            Err(failure) => failures.push(failure),
+            Ok(video) => {
+                youtube_access::cache_analysis(&app, &video);
+                videos.push(video);
+            }
+            Err(mut failure) => {
+                failure.retry_after_epoch = youtube_access::cooldown_until(&app);
+                if let Some(until) = failure.retry_after_epoch {
+                    failure.message = youtube_access::cooldown_message(until);
+                }
+                failures.push(failure);
+            }
         }
     }
     Ok(AnalysisResult { videos, failures })
 }
 
 #[tauri::command]
-async fn analyze_urls(app: tauri::AppHandle, urls: Vec<String>) -> Result<AnalysisResult, String> {
-    tauri::async_runtime::spawn_blocking(move || analyze_urls_blocking(app, urls))
-        .await
-        .map_err(|_| "El análisis se interrumpió inesperadamente.".to_owned())?
+async fn analyze_urls(
+    app: tauri::AppHandle,
+    urls: Vec<String>,
+    ignore_history: Option<bool>,
+) -> Result<AnalysisResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        analyze_urls_blocking(app, urls, ignore_history.unwrap_or(false))
+    })
+    .await
+    .map_err(|_| "El análisis se interrumpió inesperadamente.".to_owned())?
 }
 
 pub(crate) struct ResolvedDownloadSource {
@@ -1094,6 +1111,7 @@ pub(crate) fn resolve_download_source(
     app: &tauri::AppHandle,
     url: &str,
     required_height: Option<u32>,
+    excluded_format_id: Option<&str>,
 ) -> Result<ResolvedDownloadSource, String> {
     let paths = engine::EnginePaths::resolve(app);
     paths.required_for_youtube()?;
@@ -1106,7 +1124,6 @@ pub(crate) fn resolve_download_source(
         .deno
         .as_ref()
         .ok_or_else(|| "Deno no está disponible.".to_owned())?;
-    let mut unusable_browsers = HashSet::new();
     let video = analyze_url_automatically(
         app,
         &paths,
@@ -1115,7 +1132,6 @@ pub(crate) fn resolve_download_source(
         deno,
         url,
         &yt_dlp_version(binary),
-        &mut unusable_browsers,
     )
     .map_err(|failure| failure.message)?;
     let quality = match required_height {
@@ -1128,10 +1144,23 @@ pub(crate) fn resolve_download_source(
         ),
         None => video.qualities.first(),
     };
+    let selected_format = quality.and_then(|quality| {
+        quality
+            .video_formats
+            .iter()
+            .filter(|format| Some(format.id.as_str()) != excluded_format_id)
+            .max_by(|left, right| preferred_format(left, right))
+    });
+    if required_height.is_some() && selected_format.is_none() {
+        let height = required_height.expect("required height was checked above");
+        return Err(format!(
+            "No queda otra fuente utilizable para {height}p; no se descargó una resolución inferior. Elegí otra resolución y volvé a intentarlo."
+        ));
+    }
     Ok(ResolvedDownloadSource {
         strategy: video.access_strategy,
-        format_id: quality.map(|quality| quality.format_id.clone()),
-        format_has_audio: quality.map(|quality| quality.format_has_audio),
+        format_id: selected_format.map(|format| format.id.clone()),
+        format_has_audio: selected_format.map(|format| format.has_audio),
     })
 }
 
@@ -1206,20 +1235,21 @@ fn remove_history_entry(app: tauri::AppHandle, id: String) -> Result<(), String>
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        browser_fallback_order, classify_youtube_failure, parse_video, youtube_failure_message,
-        youtube_requires_browser_session, BrowserSession, YoutubeAccessStrategy,
-        YoutubeFailureClass,
+        automatic_failure, classify_youtube_failure, parse_video, youtube_failure_message,
+        youtube_requires_browser_session, youtube_video_id, AnalysisAttemptFailure, BrowserSession,
+        YoutubeAccessStrategy, YoutubeFailureClass,
     };
     use serde_json::json;
 
     #[test]
-    fn exposes_only_direct_downloadable_resolutions() {
+    fn exposes_downloadable_resolutions_and_excludes_super_resolution() {
         let metadata = json!({
             "id": "example",
             "title": "Example",
             "formats": [
                 { "format_id": "401", "ext": "webm", "width": 3840, "height": 2160, "fps": 30, "vcodec": "av01", "acodec": "none", "tbr": 12000, "format_note": "2160p", "url": "https://example.test/2160" },
                 { "format_id": "399", "ext": "mp4", "width": 1920, "height": 1080, "fps": 60, "vcodec": "avc1", "acodec": "none", "tbr": 7000, "url": "https://example.test/1080" },
+                { "format_id": "247-sr", "ext": "webm", "width": 1280, "height": 720, "fps": 30, "vcodec": "vp9", "acodec": "none", "tbr": 2500, "format_note": "720p", "url": "https://example.test/720-sr" },
                 { "format_id": "sb0", "ext": "mhtml", "width": 1920, "height": 1080, "vcodec": "avc1", "acodec": "none", "format_note": "storyboard", "url": "https://example.test/storyboard" },
                 { "format_id": "drm", "ext": "mp4", "width": 1280, "height": 720, "vcodec": "avc1", "acodec": "none", "has_drm": true, "url": "https://example.test/drm" },
                 { "format_id": "missing", "ext": "mp4", "width": 854, "height": 480, "vcodec": "avc1", "acodec": "none" }
@@ -1237,6 +1267,27 @@ mod tests {
             .collect();
         assert_eq!(heights, vec![2160, 1080]);
         assert_eq!(video.qualities[0].format_id, "401");
+        assert!(video
+            .formats
+            .iter()
+            .all(|format| !format.id.ends_with("-sr")));
+    }
+
+    #[test]
+    fn normalizes_common_video_urls_before_any_network_access() {
+        let id = "eUV9noIBD8I";
+        assert_eq!(
+            youtube_video_id(&format!("https://www.youtube.com/watch?v={id}&t=1324s")),
+            Some(id.to_owned())
+        );
+        assert_eq!(
+            youtube_video_id(&format!("https://youtu.be/{id}?si=example")),
+            Some(id.to_owned())
+        );
+        assert_eq!(
+            youtube_video_id(&format!("https://www.youtube.com/shorts/{id}")),
+            Some(id.to_owned())
+        );
     }
 
     #[test]
@@ -1293,6 +1344,19 @@ mod tests {
     }
 
     #[test]
+    fn account_required_stops_without_reading_browser_sessions() {
+        let failure = automatic_failure(
+            "https://www.youtube.com/watch?v=example".to_owned(),
+            &[AnalysisAttemptFailure {
+                class: YoutubeFailureClass::AccountRequired,
+                message: None,
+            }],
+        );
+        assert!(failure.requires_browser_session);
+        assert!(failure.message.contains("no lee ni usa sesiones"));
+    }
+
+    #[test]
     fn classifies_retryable_and_terminal_failures_structurally() {
         assert_eq!(
             classify_youtube_failure("ERROR: Sign in to confirm you're not a bot"),
@@ -1313,19 +1377,9 @@ mod tests {
     }
 
     #[test]
-    fn access_order_uses_pot_for_antibot_but_never_browser_cookies() {
+    fn access_order_uses_pot_for_antibot_without_browser_cookies() {
         assert!(YoutubeFailureClass::AntiBotChallenge.warrants_pot());
-        assert!(!YoutubeFailureClass::AntiBotChallenge.warrants_browser());
-        assert!(YoutubeFailureClass::AccountRequired.warrants_browser());
-        assert_eq!(
-            browser_fallback_order(),
-            [
-                BrowserSession::Firefox,
-                BrowserSession::Edge,
-                BrowserSession::Chrome,
-                BrowserSession::Brave
-            ]
-        );
+        assert!(!YoutubeFailureClass::AccountRequired.warrants_pot());
     }
 
     #[test]
@@ -1360,8 +1414,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(download::DownloadManager::default())
         .manage(engine::PotProviderManager::default())
+        .manage(youtube_access::YoutubeAccessManager::default())
         .setup(|app| {
             history::initialize(app.handle()).map_err(Box::<dyn std::error::Error>::from)?;
+            youtube_access::initialize(app.handle()).map_err(Box::<dyn std::error::Error>::from)?;
             // A process launched by a development host can inherit a minimized
             // show-state on Windows. Always present the main desktop window.
             if let Some(window) = app.get_webview_window("main") {

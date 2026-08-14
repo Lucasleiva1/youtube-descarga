@@ -60,6 +60,10 @@ export interface AnalysisFailure {
   message: string;
   /** True only when the content itself requires a signed-in account. */
   requiresBrowserSession: boolean;
+  /** Existing local history record; opening it does not contact YouTube. */
+  existingDownloadId?: string | null;
+  /** Unix epoch at which the local request cooldown ends. */
+  retryAfterEpoch?: number | null;
 }
 
 export interface AnalysisResult {
@@ -137,6 +141,7 @@ export interface DownloadJob extends AddDownloadJobRequest {
   createdAt?: string;
   completedAt?: string;
   verification?: DownloadVerification;
+  automaticRetryCount?: number;
 }
 
 /**

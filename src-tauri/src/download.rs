@@ -1,6 +1,7 @@
 use crate::{
     classify_youtube_failure, configure_youtube_access, engine, hidden_command, history,
-    youtube_failure_message, BrowserSession, YoutubeAccessStrategy, YoutubeFailureClass,
+    youtube_access, youtube_failure_message, BrowserSession, YoutubeAccessStrategy,
+    YoutubeFailureClass,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -93,6 +94,8 @@ pub struct DownloadJob {
     pub created_at: Option<String>,
     pub completed_at: Option<String>,
     pub verification: Option<DownloadVerification>,
+    #[serde(default)]
+    pub automatic_retry_count: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,6 +168,12 @@ fn valid_browser_session(value: Option<&str>) -> bool {
 impl DownloadRequest {
     fn effective_access_strategy(&self) -> Result<YoutubeAccessStrategy, String> {
         if let Some(strategy) = self.access_strategy.as_ref() {
+            if matches!(strategy, YoutubeAccessStrategy::Browser { .. }) {
+                return Err(
+                    "El acceso con cuentas de navegador está deshabilitado por privacidad."
+                        .to_owned(),
+                );
+            }
             return Ok(strategy.clone());
         }
         let browser = match self.browser_session.as_deref() {
@@ -175,10 +184,12 @@ impl DownloadRequest {
             None => None,
         };
         Ok(match browser {
-            Some(browser) => YoutubeAccessStrategy::Browser {
-                browser,
-                use_pot_provider: self.use_pot_provider,
-            },
+            Some(_) => {
+                return Err(
+                    "El acceso con cuentas de navegador está deshabilitado por privacidad."
+                        .to_owned(),
+                )
+            }
             None if self.use_pot_provider => YoutubeAccessStrategy::Pot,
             None => YoutubeAccessStrategy::Public,
         })
@@ -321,6 +332,7 @@ pub fn add(app: AppHandle, mut request: DownloadRequest) -> Result<DownloadJob, 
         created_at: Some(now_string()),
         completed_at: None,
         verification: None,
+        automatic_retry_count: 0,
     };
     app.state::<DownloadManager>()
         .state
@@ -407,6 +419,33 @@ pub fn start_one(app: AppHandle, job_id: String) -> Result<(), String> {
     emit_queue(&app);
     thread::spawn(move || {
         run_job(&app, &job);
+        let retry_scheduled = find_job(&app, &job.job_id).is_some_and(|current| {
+            current.status == DownloadStatus::Queued
+                && current.automatic_retry_count > job.automatic_retry_count
+        });
+        if retry_scheduled {
+            youtube_access::wait_for_cooldown(&app);
+            let retry_job =
+                app.state::<DownloadManager>()
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|mut state| {
+                        if state.paused {
+                            return None;
+                        }
+                        let retry = state.jobs.iter_mut().find(|current| {
+                            current.job_id == job.job_id && current.status == DownloadStatus::Queued
+                        })?;
+                        retry.status = DownloadStatus::Downloading;
+                        retry.message = Some("Reintentando automáticamente…".to_owned());
+                        Some(retry.clone())
+                    });
+            if let Some(retry_job) = retry_job {
+                emit_queue(&app);
+                run_job(&app, &retry_job);
+            }
+        }
         if let Ok(mut state) = app.state::<DownloadManager>().state.lock() {
             state.worker_running = false;
         }
@@ -437,6 +476,7 @@ fn next_job(app: &AppHandle) -> Option<DownloadJob> {
 }
 fn run_queue(app: AppHandle) {
     loop {
+        youtube_access::wait_for_cooldown(&app);
         let Some(job) = next_job(&app) else {
             emit_queue(&app);
             break;
@@ -459,6 +499,26 @@ fn run_job(app: &AppHandle, job: &DownloadJob) {
         let cancelled = find_job(app, &job.job_id)
             .is_some_and(|current| current.status == DownloadStatus::Cancelled);
         if !cancelled {
+            if youtube_access::cooldown_until(app).is_some() && job.automatic_retry_count == 0 {
+                let message = "YouTube pidió una pausa. Reintento automático programado al terminar los 30 minutos.".to_owned();
+                update_job(app, &job.job_id, |current| {
+                    current.status = DownloadStatus::Queued;
+                    current.automatic_retry_count = 1;
+                    current.error = None;
+                    current.message = Some(message.clone());
+                    current.progress = DownloadProgress::default();
+                });
+                emit_job(
+                    app,
+                    "download://retry-scheduled",
+                    &job.job_id,
+                    true,
+                    None,
+                    Some(message),
+                    None,
+                );
+                return;
+            }
             update_job(app, &job.job_id, |current| {
                 current.status = DownloadStatus::Failed;
                 current.error = Some(error.clone());
@@ -658,6 +718,10 @@ fn run_download_attempt(
     engine_version: &str,
 ) -> Result<PathBuf, DownloadAttemptFailure> {
     let started = std::time::Instant::now();
+    youtube_access::begin_network_operation(app).map_err(|message| DownloadAttemptFailure {
+        class: YoutubeFailureClass::RateLimited,
+        message,
+    })?;
     let result = (|| {
         let binary = paths
             .yt_dlp
@@ -692,17 +756,20 @@ fn run_download_attempt(
                 "--ignore-config",
                 "--no-plugin-dirs",
                 "--no-playlist",
+                "--force-ipv4",
                 "--check-formats",
                 "--socket-timeout",
                 "20",
                 "--newline",
                 "--progress",
                 "--retries",
-                "3",
-                "--fragment-retries",
-                "3",
-                "--retry-sleep",
                 "2",
+                "--fragment-retries",
+                "2",
+                "--retry-sleep",
+                "http:exp=3:15",
+                "--retry-sleep",
+                "fragment:exp=3:15",
                 "--windows-filenames",
                 "--trim-filenames",
                 "180",
@@ -716,6 +783,7 @@ fn run_download_attempt(
             .arg(ffmpeg_directory)
             .arg("--js-runtimes")
             .arg(format!("deno:{}", deno.display()));
+        youtube_access::configure_extraction_pacing(&mut command);
         configure_youtube_access(&mut command, strategy);
         if let Some(provider) = pot_provider.as_ref() {
             engine::configure_pot_provider(&mut command, provider);
@@ -807,6 +875,7 @@ fn run_download_attempt(
                 message: "yt-dlp no informó la ruta final del archivo.".to_owned(),
             })
     })();
+    youtube_access::finish_network_operation(app);
     let outcome = match &result {
         Ok(_) => "success",
         Err(failure) => failure.class.code(),
@@ -827,7 +896,6 @@ fn refreshable_download_failure(class: YoutubeFailureClass) -> bool {
     matches!(
         class,
         YoutubeFailureClass::RequestedFormatUnavailable
-            | YoutubeFailureClass::AntiBotChallenge
             | YoutubeFailureClass::PotRequired
             | YoutubeFailureClass::PotUnavailable
             | YoutubeFailureClass::CookieDatabaseLocked
@@ -838,6 +906,9 @@ fn refreshable_download_failure(class: YoutubeFailureClass) -> bool {
 }
 
 fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
+    if let Some(until) = youtube_access::cooldown_until(app) {
+        return Err(youtube_access::cooldown_message(until));
+    }
     let paths = paths_ready(app)?;
     let destination = output_directory(job)?;
     let binary = paths
@@ -861,11 +932,21 @@ fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
             &engine_version,
         ) {
             Ok(file) => break file,
+            Err(failure)
+                if matches!(
+                    failure.class,
+                    YoutubeFailureClass::AntiBotChallenge | YoutubeFailureClass::RateLimited
+                ) =>
+            {
+                let until = youtube_access::activate_cooldown(app, failure.class.code());
+                return Err(youtube_access::cooldown_message(until));
+            }
             Err(failure) if !refreshed && refreshable_download_failure(failure.class) => {
                 let resolved = crate::resolve_download_source(
                     app,
                     &job.request.url,
                     job.request.quality_height,
+                    selected_format_id.as_deref(),
                 )?;
                 strategy = resolved.strategy;
                 selected_format_id = resolved.format_id;
@@ -878,6 +959,10 @@ fn execute_download(app: &AppHandle, job: &DownloadJob) -> Result<(), String> {
                     current.message =
                         Some("Fuente renovada; reintentando la misma calidad…".to_owned());
                 });
+            }
+            Err(failure) if refreshed && failure.class == YoutubeFailureClass::SessionRejected => {
+                let until = youtube_access::activate_cooldown(app, failure.class.code());
+                return Err(youtube_access::cooldown_message(until));
             }
             Err(failure) => return Err(failure.message),
         }
@@ -1114,6 +1199,7 @@ pub fn retry(app: AppHandle, job_id: String) -> Result<(), String> {
         job.progress = DownloadProgress::default();
         job.file_path = None;
         job.verification = None;
+        job.automatic_retry_count = 0;
         !state.paused && !state.worker_running
     };
     emit_queue(&app);

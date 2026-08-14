@@ -1,7 +1,11 @@
 .analysis-failures { display: grid; gap: 5px; margin-top: 10px; }
+.analysis-failure { display: grid; gap: 6px; padding: 8px; border: 1px solid rgba(231,163,99,.2); border-radius: 4px; background: rgba(73,48,24,.18); }
 .analysis-failures p { display: flex; align-items: center; gap: 6px; margin: 0; color: #e7a363; font-size: 11px; }
 .analysis-failures svg { color: #ef5e50; }
 .analysis-failures span { max-width: 280px; overflow: hidden; color: #d6d6d6; text-overflow: ellipsis; white-space: nowrap; }
+.analysis-failure small { color: #b9a58e; font-size: 10px; }
+.analysis-failure-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.analysis-failure-actions .secondary-button { min-height: 28px; padding: 5px 8px; font-size: 9px; }
 
 .video-card { grid-template-columns: 138px minmax(145px, 1fr) 111px 84px 82px 27px; }
 .card-queue-button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 33px; padding: 7px 5px; color: #eee; border: 1px solid rgba(255,255,255,.13); border-radius: 4px; background: #2a2a2a; font-size: 9px; font-weight: 700; }
